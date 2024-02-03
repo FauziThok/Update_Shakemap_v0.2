@@ -14,22 +14,6 @@ gmt set MAP_TITLE_OFFSET 14p
 gmt set MAP_FRAME_WIDTH 5p
 gmt set MAP_FRAME_PEN thicker,black
 
-
-# GitHub repository URL
-repo_url="https://github.com/FauziThok/Update_Shakemap_v0.2.git"
-
-# Specify the target directory
-target_directory="/home/sysop"
-
-# Navigate to the target directory
-cd "$target_directory" || exit
-
-# Clone the GitHub repository
-git clone "$repo_url" .
-
-# Print a message indicating successful download
-printf "Repository downloaded and placed in $target_directory \n"
-
 ## Create backup files
 mv /home/sysop/bin/SC-run-SM.sh /home/sysop/bin/SC-run-SM.sh.old
 mv /home/sysop/shakemap/bin/mapping /home/sysop/shakemap/bin/mapping.old
