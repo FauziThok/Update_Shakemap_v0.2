@@ -1,0 +1,3166 @@
+#!/usr/bin/perl 
+
+# $Id: mapping 443 2011-10-11 16:15:11Z cbworden $ USGS
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use ShakeConfig;
+use lib "$shake_perl_lib";
+use Shake::Opt;
+use Shake::Die;
+use Shake::Version;
+use Shake::LoadConfig;
+use Shake::GMThd;
+use Shake::Source;
+use Shake::Station;
+use Shake::DataArray;
+use Shake::GridIterator;
+use Shake::Pipe2;
+use Shake::Timezone;
+use Shake::Constants qw( @RAW_PARAMETERS );
+use Shake::Info;
+
+use Genex::Constants qw( :genex :jpg ); 
+
+use FileHandle;
+use File::Path;
+use File::Spec;
+use File::Basename qw(basename);
+use IPC::Open2;
+use Time::CTime;
+
+use vars qw ( $have_y2038 );
+eval "use Time::y2038";
+if ($@) {
+  eval "use Time::Local";
+  $have_y2038 = 0;
+} else {
+  $have_y2038 = 1;
+  eval "use Time::y2038::Everywhere";
+}
+
+#######################################################################
+# Global variables
+#######################################################################
+
+use vars qw(%map_coords %block);
+my $arglist    = "@ARGV";		# save the arguments for entry
+					# into the database
+#-----------------------------------------------------------------------
+# Map size parameters (cm)
+#-----------------------------------------------------------------------
+my $width     = 16.51;
+my $tvwidth   = 25.4;
+my $xorig     = 2.54;
+my $yorig     = 2.54;
+
+my $ticks     = 'a60mf30mWSen';		# psbasemap annotation string
+					# for use with the -B flag
+
+#-----------------------------------------------------------------------
+# Use UTC (i.e., GMT) as the time format -- for Global Shakemap
+#-----------------------------------------------------------------------
+my $use_utc = 1;
+
+#-----------------------------------------------------------------------
+# Specifies the units for sizes and locations of items on the maps. 
+#-----------------------------------------------------------------------
+my $measure_unit;
+
+#-----------------------------------------------------------------------
+# Default x/y resolution of the Intensity map
+#-----------------------------------------------------------------------
+my $mi_xres   = '30c';
+my $mi_yres   = '30c';
+my $mi_xhires =  '3c';
+my $mi_yhires =  '3c';
+
+#-----------------------------------------------------------------------
+# @xymax -- maximum map coordinates in inches from the lower left corner
+# of the mapped area:
+#	$xymax[0] == right edge => xy_right
+#	$xymax[1] == top_edge   => xy_top
+# (The => indicate the equivalent variables in pga.pl)
+# @tvxymax are the dimensions of the tv map
+#-----------------------------------------------------------------------
+my @xymax;				
+my @tvxymax;				
+my @iixymax;
+
+#-----------------------------------------------------------------------
+# @xinfo -- contains files and flags from the psxy_addon config option;
+# @textinfo -- contains files and flags from the pstext_addon config option;
+# allows user-defined map overlays through the GMT psxy and pstext commands.
+#	$info[n]->{'FILE'}  == file name of the psxy- or pstext-formatted input
+#	$info[n]->{'FLAGS'} == flags to pass to psxy or pstext
+#-----------------------------------------------------------------------
+my @xyinfo;
+my @textinfo;
+
+#-----------------------------------------------------------------------
+# use_gmt_coast determines whether or not to run pscoast 
+#-----------------------------------------------------------------------
+my $use_gmt_coast = 'true';
+
+#-----------------------------------------------------------------------
+# Customization for the intensity map
+#-----------------------------------------------------------------------
+my $faults_on_mi          = 0;
+my $stations_on_mi        = 1;
+my $filled_stations_on_mi = 0;
+
+#----------------------------------------------------------------------
+# The name of the map-producing organization for inclusion in map titles
+#----------------------------------------------------------------------
+my $organization;
+
+#----------------------------------------------------------------------
+# net_color and sta_color specify the color of the seismic stations for 
+# various networks; the default is yellow, other colors and networks are
+# specified in the config file
+#----------------------------------------------------------------------
+my %net_color  = ( 'DEFAULT' => { 'color' => '255/255/0',
+				  'symbol' => 't',
+				  'size' => 0.305 });
+my %sta_color;
+my $sta_symbol = 't';			# the symbol used to represent the 
+					# seismic stations
+my $sta_size   = 0.305;			# the size (in inches) of the 
+					# stations
+
+#----------------------------------------------------------------------
+# The color of the PGA/PGV contours and the annotation text; override 
+# in the config
+#----------------------------------------------------------------------
+my $cont_color     = 'yellow';
+my $ncontours      = 8;			# The approx. number of contours
+my $cont_width     = 8;
+
+#----------------------------------------------------------------------
+# Color and width settings for other map overlays
+#----------------------------------------------------------------------
+my $highway_color   = 'darkgrey';
+my $highway_width   = 8;
+my $fault_color     = 'darkred';
+my $fault_width     = 8;
+my $ff_color     = 'darkgrey';
+my $ff_width     = 12;
+my $border_width    = 8;
+my $water_color     = 'lightblue';
+my $epicenter_color;
+my $epicenter_size  = "0.406";
+
+my $main_title_size = 15;		# Point size of the map title
+my $sub_title_size  = 12;		# Point size of the map subtitle
+my $city_dot_size   = "0.203";		# Size of the dot representing a city
+my $city_name_size  = 9;		# Size of the city name font
+
+#----------------------------------------------------------------------
+# Settings for the TV map
+#----------------------------------------------------------------------
+my $tv_highway_width   = 8;
+my $tv_highway_color   = 'lightgrey';
+my $tv_border_width    = 10;		# Border around the map edge
+my $tv_city_dot_size   = "0.203";	# Size of the dot representing a city
+
+#----------------------------------------------------------------------
+# These ratios determine how close to the edge of a (TV) map a city
+# will be plotted (and, thus, labelled)
+#----------------------------------------------------------------------
+my $tvlonratio  = 1.0 / 13.0;
+my $tvlatratio  = 1.0 / 11.0;
+
+#----------------------------------------------------------------------
+# Hash of color codes loaded when $colorfile is parsed
+#----------------------------------------------------------------------
+my %colors     = ();
+
+#----------------------------------------------------------------------
+# Name of the configuration file
+#----------------------------------------------------------------------
+my $cfile      = "mapping.conf";
+my $colorfile  = "colors.conf";
+my $webcfile   = "web.conf";
+
+#----------------------------------------------------------------------
+# Path to bits of extra PostScript
+#	psdir    - where to find them
+#	scale.ps - the default mi scale/legend 
+#	tvscale.ps - the tvmap scale/legend 
+#----------------------------------------------------------------------
+my $psdir       = "$shake_home/lib/ps";
+my $milegend   = 'scale.ps';
+my $tvmilegend = 'tvscale.ps';
+
+my $tvguide    = 'tvguide.txt';
+
+#----------------------------------------------------------------------
+# Path to the echo command
+#----------------------------------------------------------------------
+my $echo      = "$shake_home/bin/echo";
+
+#----------------------------------------------------------------------
+# $map_data_dir is the default location for mapping data, it may be overridden
+# within the config file using the map_data_dir statement
+#----------------------------------------------------------------------
+my $map_data_dir = "$shake_home/lib/mapping";
+
+#----------------------------------------------------------------------
+# The colormaps below must be defined in the config file
+#----------------------------------------------------------------------
+my $topo_cmap;				# GMT colormap for topography
+my $ii_cmap;				# GMT colormap for instrumental intens.
+my $ii_tvmap_cmap;			# GMT colormap for TV map version
+					# of instrumental intensity map
+my $sd_cmap;                    	# GMT colormap for Uncertainty Map
+
+#----------------------------------------------------------------------
+# The map data files (following) must be specified in the config or
+# the attribute will not appear in the map.
+#----------------------------------------------------------------------
+my $map_roads;				# GMT XY file for roads (lon,lat)
+my $map_faults;				# GMT fault segment data (lat,lon)
+my $map_cities;				# Text file for cities (lat,lon,name)
+my $map_cities_label;			# Text file for GMT pstext formatted 
+					# city labels -- see config file
+my $big_cities;				# Text file of large cities for TV map
+my $very_big_cities;			# Text file of large cities for TV map
+my $big_cities_label;			# Text file of GMT pstext formatted
+					# city labels for TV map
+my $very_big_cities_label;		# Text file of GMT pstext formatted
+					# city labels for TV map
+my $map_topo;				# normal GMT topography (.grd)
+my $map_topo_hires;			# high-resolution GMT topography (.grd)
+my $map_intensity;			# Pre-computed topo intensity
+my $map_intensity_hires;		# Pre-computed hires topo intensity
+
+#----------------------------------------------------------------------
+# Map boundaries
+#----------------------------------------------------------------------
+my $lonspan;
+my $latspan;
+my $lonmin;
+my $lonmax;
+my $latmin;
+my $latmax;
+my $gmtflags;
+my $tvgmtflags;
+
+my $noscenariosplash;
+
+#######################################################################
+# End global variables
+#######################################################################
+
+#######################################################################
+# Stuff to handle command line options and program documentation:
+#######################################################################
+
+my $desc = 'Generate PostScript GMT maps of computed ground motion '
+	 . 'parameters.';
+
+my $flgs = [{ FLAG => 'event',
+	      ARG  => 'event_id',
+              TYPE => 's',
+	      REQ  => 'y',
+	      DESC => 'Specifies the id of the event to process'},
+	    { FLAG => 'config',
+	      ARG  => 'path',
+              TYPE => 's',
+	      REQ  => 'y',
+	      DESC => 'Designates a config file to use in place of the '
+		    . 'defaults; if this file is not found, the program '
+		    . 'exits with an error.'},
+            { FLAG => 'gsm',
+              DESC => 'Global ShakeMap.  Changes the behavior of the '
+                    . 'program to accomodate the GSM system at the NEIC '
+                    . 'in Golden, CO.  Are you running the GSM system '
+                    . 'in Golden, CO?  If not, you do not want this option.'},
+            { FLAG => 'hires',
+              DESC => 'Use high-resolution grids to create maps.'},
+            { FLAG => 'itopo',
+              DESC => 'Include topography on the intensity maps.'},
+            { FLAG => 'plotests',
+              DESC => 'This option is obsolete and will disappear in a '
+                    . 'future release.'},
+            { FLAG => 'poster',
+              DESC => 'Generate a PostScript file for a poster-sized map.'},
+            { FLAG => 'ascii',
+              DESC => 'This option is obsolete and will disappear in a '
+                    . 'future release.'},
+            { FLAG => 'tvmap',
+              DESC => 'Make a map suitable for broadcast television.'},
+            { FLAG => 'timestamp',
+              DESC => 'Add to the maps a timestamp indicating the time '
+		    . 'of processing.'},
+            { FLAG => 'notchecked',
+              DESC => 'This option is obsolete and will disappear in a '
+                    . 'future release.'},
+            { FLAG => 'pgminten',
+              DESC => 'Fill the PGM station symbols with their computed '
+                    . 'intensity.'},
+            { FLAG => 'scenario',
+              DESC => 'Mark the maps to indicate this is a scenario '
+		    . 'earthquake.'},
+            { FLAG => 'forcerun',
+              DESC => 'Override out-of-sequence and lock errors generated by '
+                    . 'Version.pm.'},
+            { FLAG => 'verbose',
+              DESC => 'Print more informational messages to stderr.'},
+            { FLAG => 'help',
+              DESC => 'Print program documentation and quit.'}
+           ];
+
+my $options = Opt::setOptions($flgs) or Die "Error in setOptions";
+
+if (defined $options->{'help'}) {
+  Opt::printDoc($desc);
+  exit 0;
+}
+
+defined $options->{'event'}
+        or Die "Must specify an event with -event flag";
+
+my $evid       = $options->{'event'};
+my $verbose    = defined $options->{'verbose'}    ? 1 : 0;
+my $gsm        = defined $options->{'gsm'}        ? 1 : 0;
+my $hires      = defined $options->{'hires'}      ? 1 : 0;
+my $itopo      = defined $options->{'itopo'}      ? 1 : 0;
+my $poster     = defined $options->{'poster'}     ? 1 : 0;
+my $timestamp  = defined $options->{'timestamp'}  ? 1 : 0;
+my $tvmap      = defined $options->{'tvmap'}      ? 1 : 0;
+my $scenario   = defined $options->{'scenario'}   ? 1 : 0;
+my $forcerun   = defined $options->{'forcerun'}   ? 1 : 0;
+my $fill_pgm_intensity = defined $options->{'pgminten'} ? 1 : 0;
+
+# Obsolete options:
+my $notchecked = defined $options->{'notchecked'} ? 1 : 0;
+my $plotests   = defined $options->{'plotests'}   ? 1 : 0;
+my $ascii      = defined $options->{'ascii'}      ? 1 : 0;
+if ($ascii) {
+  print "The -ascii option is obsolete and will disappear in a future release. "
+      . "Please remove it from your configuration files.\n";
+  $arglist =~ s/-ascii//;
+}
+if ($plotests) {
+  print "The -plotests option is obsolete and will disappear in a future"
+      . "release.  Please remove it from your configuration files.\n";
+  $arglist =~ s/-plotests//;
+}
+if ($notchecked) {
+  print "The -notchecked option is obsolete and will disappear in a future "
+      . "release.  Please remove it from your configuration files.\n";
+  $arglist =~ s/-notchecked//;
+}
+
+$cfile = $options->{'config'} if defined $options->{'config'};
+
+$scenario = 1 if ($evid =~ /_(se|SE)$/i);
+
+Die "Unknown argument(s): @ARGV" if (@ARGV);
+
+#-----------------------------------------------------------------------
+# $inputdir is where we expect to find all of the grd input files
+# $outputdir is where we put our output
+#-----------------------------------------------------------------------
+my $datadir   = "$shake_home/data/$evid/input";
+my $inputdir  = "$shake_home/data/$evid/output";
+my $outputdir = "$shake_home/data/$evid/mapping";
+
+if (not -d $outputdir) {
+  mkpath("$outputdir", 0, 0755) or Die "Couldn't create $outputdir";
+}
+my @tmpfiles = <$outputdir/*>;
+unlink @tmpfiles if (@tmpfiles);
+
+
+#######################################################################
+# End of command line option stuff
+#######################################################################
+
+#######################################################################
+# Run the program...
+#######################################################################
+
+main();
+
+#######################################################################
+# Subroutines
+#######################################################################
+
+sub main {
+
+  my $command;
+  my ($namecmd, $loccmd, $nmobj, $locobj);
+  my ($lat, $lon, $cname, $map_bound);
+  my $display;
+  my ($file, $line);
+  my ($x, $y);
+  my ($sta);
+  my ($xres, $yres);
+  my $prog = basename($0);
+  my $mflag;
+  my %p2ix = ( 'pga'   => 0,
+               'pgv'   => 1,
+               'psa03' => 2,
+               'psa10' => 3,
+               'psa30' => 4 );
+
+  #----------------------------------------------------------------------
+  # Check that we can run this program, and set a lock
+  # $loc_db_conf and $loc_db_dirs are defined in the ShakeConfig module
+  #----------------------------------------------------------------------
+  my $sv = new Version($evid, $loc_db_conf, $loc_db_dirs)
+      or Die "Could not create Version object";
+  $sv->runProg($prog, $forcerun)
+      or Die "Problems in Shake::Version->runProg, quitting.";
+  my $version = $sv->getVersion;
+  if (not $version) {
+    $version = 1;
+  } else {
+    $version++;
+  }
+
+  #-----------------------------------------------------------------------
+  # Check that GMT is installed and all the programs we need are 
+  # available
+  #-----------------------------------------------------------------------
+  my @gmtprogs = qw { gmtset mapproject psbasemap grdcut grdgradient 
+		      grdimage psxy pscoast pstext grdsample grd2xyz 
+		      nearneighbor grdcontour grdview };
+  -e $gmt_bin or Die "GMT directory $gmt_bin not fount";
+  foreach my $prog ( @gmtprogs ) {
+    -e "$gmt_bin/$prog" or Die "GMT program $prog not found";
+  }
+  if($GMTmajorVersion < 4 or ($GMTmajorVersion == 4 and $GMTminorVersion < 5)) {
+    $mflag = '-M';
+  } else {
+    $mflag = '-m';
+  }
+
+  #----------------------------------------------------------------------
+  # Make sure there is something to do
+  #----------------------------------------------------------------------
+  my @grdfiles = <$inputdir/*.grd>;
+
+  (@grdfiles > 1 and grep(/pga/, @grdfiles) and grep(/pgv/, @grdfiles))
+  	or Die "Not enough grd files in $inputdir: ",
+			join(" ", @grdfiles), "\n",
+		       "Need at least pga.grd, pgv.grd";
+
+  #----------------------------------------------------------------------
+  # Parse the config files
+  #----------------------------------------------------------------------
+  configure();
+
+  #----------------------------------------------------------------------
+  # Check that all colors, including defaults not set in the config file,
+  # have been converted from color codes to RGB values
+  #----------------------------------------------------------------------
+  check_colors();
+
+  #----------------------------------------------------------------------
+  # Just in case someone redefined yellow when we weren't looking...
+  #----------------------------------------------------------------------
+  $net_color{'DEFAULT'}{'color'} = $colors{'yellow'} 
+				if defined $colors{'yellow'};
+  #----------------------------------------------------------------------
+  # Check that the required colormaps have been defined in the config
+  #----------------------------------------------------------------------
+  (defined $topo_cmap and defined $ii_cmap and defined $ii_tvmap_cmap)
+	or Die "Must specify topo_cmap, ii_cmap, and ii_tvmap_cmap in "
+	     . "the config file";
+
+  #----------------------------------------------------------------------
+  # If running with -pgminten, get the intensities from intensity.txt
+  # If the file isn't there, turn off the flag and warn the user.
+  #----------------------------------------------------------------------
+  my %pinten;
+  if ($fill_pgm_intensity and -e "$outputdir/../richter/intensities.txt") {
+      open RDR, "< $outputdir/../richter/intensities.txt" 
+           or Die "Can't open intensity file.";
+      my @lines = <RDR>;
+      my ($line, $code, @vals);
+      foreach $line ( @lines ) {
+        chomp $line;
+        ($code, @vals) = split " ", $line;
+        @{$pinten{$code}} = @vals;
+      }
+      close RDR;
+  }
+
+  #----------------------------------------------------------------------
+  # If there is an event name in the earthquake database, get it
+  #----------------------------------------------------------------------
+  my $event_name;
+  my $dbc = new DbConnect($loc_db_conf, $loc_db_dirs)
+	    or Die "Error: couldn't config database with $loc_db_conf";
+  my $dbh = $dbc->connect
+	    or Die "Error: couldn't establish database connection";
+  my $sth = $dbh->prepare("select name from earthquake where evid = ?");
+  $sth->execute($evid);
+  ($event_name) = $sth->fetchrow_array;
+
+  #-----------------------------------------------------------------------
+  # Get the SD grade and mean, if available
+  #-----------------------------------------------------------------------
+  my $info = new Info($evid,'read');
+  my $grade  = $info->value('grade');
+  my $mean_sd = sprintf "%.3f", $info->value('mean_uncertainty');
+
+  #-----------------------------------------------------------------------
+  # Get the name of the Intensity legend, if available
+  #-----------------------------------------------------------------------
+  my $tmplegend = $info->value('miscale');
+  $milegend = $tmplegend if defined $tmplegend;
+
+  $info = undef;
+
+  #-----------------------------------------------------------------------
+  # Get the station list 
+  #-----------------------------------------------------------------------
+  my ($data);
+  -e "$inputdir/stationlist.xml" or Die "Can't find $inputdir/stationlist.xml";
+  $data = DataArray->new("$inputdir/stationlist.xml") 
+		or Die "Couldn't parse $inputdir/stationlist.xml";
+
+  my $src = $data->source;
+  $map_coords{epilat} = $src->lat;
+  $map_coords{epilon} = $src->lon;
+
+  #-----------------------------------------------------------------------
+  # Read a grd file header to get the map boundaries...
+  #-----------------------------------------------------------------------
+  -e "$inputdir/pga.grd" or Die "No pga.grd file in $inputdir";
+  my $ghd       = new GMThd("$inputdir/pga.grd", $gmt_bin);
+
+  $lonspan    = abs($ghd->xmax() - $ghd->xmin());
+  $latspan    = abs($ghd->ymax() - $ghd->ymin());
+  $lonmin     = $ghd->xmin();
+  $lonmax     = $ghd->xmax();
+  $latmin     = $ghd->ymin();
+  $latmax     = $ghd->ymax();
+
+  # Compute central meridian
+  my ($cm, $cl);
+#  if ($lonmin > 0 and $lonmax < 0) {
+#    $cm = ($lonmin + 360 - $lonmax)/2;
+#    $cm -= 360 if ($cm > 180);
+#  } else { 
+    $cm = ($lonmin + $lonmax)/2; 
+    $cl = ($latmin + $latmax)/2; 
+#  }
+#  $map_coords{proj} = "-JQ$cm/$width";
+  $map_coords{proj} = "-JM$width";
+  $map_coords{tvproj} = "-JM$tvwidth";
+  $map_coords{iiproj} = "-JQ0/$width";
+
+  $map_coords{latspan} = $latspan;
+  $map_coords{lonspan} = $lonspan;
+
+  $ticks = "a30mf10mWSen" if ($lonspan < 2);
+  $ticks = "a240mg240mf120mWSen" if ($lonspan > 5);
+  $ticks = "a5f1WSen" if ($lonspan > 10);
+  $ticks = "a5f5WSen" if ($lonspan > 15);
+
+  $map_bound  = "$lonmin/$lonmax/$latmin/$latmax";
+  $gmtflags   = "-P -R$map_bound -JM$width";
+  $tvgmtflags = "-P -R$map_bound -JM$tvwidth";
+
+  `$gmt_bin/gmtset PLOT_DEGREE_FORMAT D`;	# For V4+ GMT
+  `$gmt_bin/gmtset LABEL_FONT_SIZE 12`;
+  `$gmt_bin/gmtset BASEMAP_FRAME_RGB 0/0/0`;
+  if ($PaperRegion =~ /US/i) {
+    `$gmt_bin/gmtset PAPER_MEDIA $PAPER{normal_us}->{name}`;
+  } elsif ($PaperRegion =~ /EU/i) {
+    `$gmt_bin/gmtset PAPER_MEDIA $PAPER{normal_eu}->{name}`;
+  } else {
+    Die "Error: unknown region for paper type: $PaperRegion\n";
+  }
+  `$gmt_bin/gmtset MEASURE_UNIT cm`;
+
+  $command = sprintf "$echo %f %f | $gmt_bin/mapproject -R$map_bound "
+	           . "-JM$width", $ghd->xmax(), $ghd->ymax();
+  slurp($command, \@xymax);
+  @xymax = split " ", $xymax[0];
+
+  $command = sprintf "$echo %f %f | $gmt_bin/mapproject -R$map_bound "
+	           . "-JM$tvwidth", $ghd->xmax(), $ghd->ymax();
+  slurp($command, \@tvxymax);
+  @tvxymax = split " ", $tvxymax[0];
+
+  $command = sprintf "$echo %f %f | $gmt_bin/mapproject -R$map_bound "
+               . "-JQ0/$width", $ghd->xmax(), $ghd->ymax();
+  slurp($command, \@iixymax);
+  @iixymax = split " ", $iixymax[0];
+
+  #-----------------------------------------------------------------------
+  # Assembling these maps is more or less a catastrophe of special
+  # cases: there are enough differences that each parameter gets some
+  # special treatment, but there are enough similarities that it makes
+  # sense to keep this all in one program; all I can hope to do is make 
+  # it somewhat configurable and somewhat maintainable
+  #-----------------------------------------------------------------------
+
+  #-----------------------------------------------------------------------
+  # We make maps in pieces, catching bits of PostScript in the hash below
+  # and then writing them out in various ways, depending on the parameter
+  # being mapped.
+  # These are the various generic pieces of PostScript that will
+  # be glued together with the contours (or images) to make the maps:
+  #-----------------------------------------------------------------------
+  my %ps = ( BASE          => [],
+	     ISB_BASE      => [],
+	     TOPO          => [],
+	     HIWAYS        => [],
+	     FAULTS        => [],
+	     COAST         => [],
+	     XYADDON       => [],
+	     TEXTADDON     => [],
+	     TITLES        => {},	# hash by map type
+	     STA_LOCS      => [],
+	     STATIONS      => {},	# hash by map type
+	     PHANTOMS      => {},	# hash by map type
+	     CITIES        => [],
+	     CENTROID      => [],
+	     EPICENTER     => [],
+	     TIMESTAMP     => [],
+	     CLOSE         => [],
+	     SCENARIO      => [],
+	     FFAULT        => [],
+	     TV_BASE       => [],
+	     OVERLAY_BASE  => [],
+	     TV_HIWAYS     => [],
+	     TV_FAULTS     => [],
+	     TV_COAST      => [],
+	     TV_XYADDON    => [],
+	     TV_TEXTADDON  => [],
+	     TV_CITIES     => [],
+	     TV_EPICENTER  => [],
+	     TV_TITLE      => [],
+	     TV_INSET      => [],
+	     TV_CLOSE      => [],
+	     TV_CLOSE_NOSB => [],
+	     OVERLAY_CLOSE => [],
+	     TV_SCALE      => [],
+	     TV_SCENARIO   => [],
+	     TV_FFAULT     => [],
+	     );
+
+  #-----------------------------------------------------------------------
+  # The params hash holds references to arrays of mapped parameter
+  # data (i.e. PostScript of contours); the migrid and mitvgrd are 
+  # handled separately because they are computed parameters that
+  # are plotted as grdimages...
+  #-----------------------------------------------------------------------
+  my %params;
+  my $migrd   = [];
+  my $mitvgrd = [];
+  my $mioverlay = [];
+  
+  #-----------------------------------------------------------------------
+  # Make each of the above bits more or less in order (with a couple of
+  # exceptions): essentially, we set up a command, run it into a pipe, and 
+  # catch the postscript output in an anonymous array held in the hash.
+  #-----------------------------------------------------------------------
+
+  #-----------------------------------------------------------------------
+  # Make the basemap
+  #-----------------------------------------------------------------------
+  my $yyorig = $yorig;;
+  $yyorig = ($yorig + $scalebar_height/2) if ($fill_pgm_intensity);
+  `$gmt_bin/gmtset BASEMAP_TYPE PLAIN FRAME_PEN 0`;
+  $command = "$gmt_bin/psbasemap -Bw $gmtflags -X$xorig -Y$yyorig -K";
+  slurp($command, $ps{BASE});
+  my $inten_yorig = $yorig + $scalebar_height;
+  $command = "$gmt_bin/psbasemap -Bw $gmtflags -X$xorig -Y$inten_yorig -K";
+  slurp($command, $ps{ISB_BASE});
+  `$gmt_bin/gmtset BASEMAP_TYPE FANCY FRAME_PEN 5`;
+
+  #-----------------------------------------------------------------------
+  # Make the highways
+  #-----------------------------------------------------------------------
+  if (defined $map_roads and -e $map_roads) {
+    $command = "$gmt_bin/psxy $map_roads $gmtflags $mflag "
+	     . "-W$highway_width/$highway_color -O -K";
+    slurp($command, $ps{HIWAYS});
+  }
+
+  #-----------------------------------------------------------------------
+  # Make the faults. If there is a finite fault in the input directory,
+  # use that too.
+  #-----------------------------------------------------------------------
+  if (defined $map_faults and -e $map_faults) {
+    $command = "$gmt_bin/psxy $map_faults $gmtflags "
+	     . "-W$fault_width/$fault_color -O -K $mflag";
+
+    slurp($command, $ps{FAULTS});
+    #-----------------------------------------------------------------------
+    # Faults go on the tvmap, too
+    #-----------------------------------------------------------------------
+    $command = "$gmt_bin/psxy $map_faults $tvgmtflags "
+	     . "-W$fault_width/$fault_color -O -K $mflag";
+    slurp($command, $ps{TV_FAULTS});
+  }
+
+  # VQ: Checks for fault files in the input/ directory.
+
+  my @faultfiles = <$datadir/*_fault.txt>;
+  my $ffault;
+
+  foreach $ffault (@faultfiles) {
+
+    $command = "$gmt_bin/psxy $gmtflags -: $ffault "
+             . "-W$ff_width/$ff_color -O -K";
+
+    # Need to check if fault file has the '>' delimiter.
+    
+    open IN_FAULT,$ffault;
+    while (<IN_FAULT>) {
+      if (/>/) { $command .= " $mflag"; last; }
+    }
+    close IN_FAULT;
+    
+    slurp($command, $ps{FFAULT});
+
+    my @segs = ();
+    my $seg = [];
+    my ($lat, $lon, $n, $i, $text);
+    open IN_FAULT,$ffault;
+    while (<IN_FAULT>) {
+      if (/>/) {
+        push @segs, $seg;
+        $seg = [];
+        next;
+      }
+      ($lat, $lon, undef) = split " ", $_;
+      push @$seg, $lat, $lon;
+    }
+    push @segs, $seg;
+    close IN_FAULT;
+    $command = "$gmt_bin/psxy $gmtflags -: -W$ff_width/${ff_color}t20_15:0 -O -K";
+    foreach $seg ( @segs ) {
+      $n = @$seg;
+      next if $n <= 10;
+      next if ($seg->[0] != $seg->[$n-2] or $seg->[1] != $seg->[$n-1]);
+      for ($i = 2; $i < ($n-1)/2 - 2; $i += 2) {
+        open2(\*RDR, \*WTR, $command);
+        printf WTR sprintf("%f %f\n", $seg->[$i], $seg->[$i+1]);
+        printf WTR sprintf("%f %f\n", $seg->[$n - 4 - $i],
+                                      $seg->[$n - 4 - $i + 1]);
+        close WTR;
+        push @{$ps{FFAULT}}, <RDR>;
+      }
+    }
+  }
+
+  #-----------------------------------------------------------------------
+  # Add the water and draw the coastline
+  #-----------------------------------------------------------------------
+  if ($use_gmt_coast eq 'true') {
+    $command = "$gmt_bin/pscoast $gmtflags -N1/$border_width "
+             . "-N2/$border_width -Df "
+	     . "-W$border_width -S$water_color -Ia/2/$water_color -O -K";
+    slurp($command, $ps{COAST});
+  }
+
+  #-----------------------------------------------------------------------
+  # Add user-defined drawing and text
+  #-----------------------------------------------------------------------
+  foreach my $h ( @xyinfo ) {
+    $command = "$gmt_bin/psxy $map_data_dir/$h->{'FILE'} $gmtflags -K -O "
+	     . "$h->{'FLAGS'}";
+    slurp($command, $ps{XYADDON});
+  }
+
+  foreach my $h ( @textinfo ) {
+    $command = "$gmt_bin/pstext $map_data_dir/$h->{'FILE'} $gmtflags -K -O "
+	     . "$h->{'FLAGS'}";
+    slurp($command, $ps{TEXTADDON});
+  }
+
+  #-----------------------------------------------------------------------
+  # Set up the titles
+  #-----------------------------------------------------------------------
+  my %title = ( 'pga'      => 'Peak Accel. Map (in %g)',
+		'pgv'      => 'Peak Velocity Map (in cm/s)',
+                'urat_pga' => 'Uncertainty Ratio Map',
+		'mi'       => 'ShakeMap',
+		'psa03'    => '0.3 s Pseudo-Acceleration Spectra (%g)',
+		'psa10'    => '1.0 s Pseudo-Acceleration Spectra (%g)',
+		'psa30'    => '3.0 s Pseudo-Acceleration Spectra (%g)' );
+	       
+  my $title_x    = $width / 2;
+  my $title_y    = $xymax[1] + 1.27;
+  my $title_suby = $xymax[1] + 0.635;
+  my $title_supy = $xymax[1] + 1.905;
+
+  my $header_main;
+  my $loc = $src->locstring();
+
+  # Remove "_se" tag from event name, if necessary.
+
+  if ($scenario) {
+    if (defined $event_name and $event_name ne '') {
+      my $nn = $event_name;
+      $nn =~ s/ *scenario//i;
+      $nn =~ s/_(se|SE)$//i;
+      $header_main = "for $nn Scenario";
+    } else {
+      #my $nn = $src->id();
+      my $nn = $src->id();
+      ###################################
+      # The "use bytes/no bytes pair below is to workaround an apparent
+      # bug in perl 5.8.5 and can be removed for other versions
+      ###################################
+      use bytes;
+      $nn =~ s/_se//i;
+      no bytes;
+      $header_main = "for $nn Scenario";
+    }
+  } elsif (defined $event_name and $event_name ne '') {
+    $header_main = "for $event_name Earthquake";
+  } elsif (defined $loc and $loc ne '') {
+    $header_main = ": $loc";
+  } else {
+    $header_main = "for event: " . $src->id();
+  }
+  my ($tz,$evdtime,$tvdate,$tvtime);
+ 
+  if ($use_utc) {
+    if ($src->timezone() ne 'UTC|GMT') {
+      $tz = $src->timezone();
+      my @months = qw(JAN FEB MAR APR MEI JUN JUL AGS SEP OKT NOV DES);
+      #my @months = qw(JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC);
+      my $hr = $src->hour();
+      my $ampm = '';
+      #my $ampm = 'AM';
+      #($hr,$ampm) = (12,'AM') if ($hr==0 or $hr==24);
+      #($hr,$ampm) = ($hr-12,'PM') if ($hr>12);
+      ($hr,$ampm) = ($hr,'');
+      my $mo = $months[($src->month())-1];
+     
+      $tvdate = sprintf("$mo %i, %i", $src->day(), $src->year());
+      $tvtime = sprintf("%02i:%02i:%02.0f $ampm$tz",$hr,
+                        $src->minute(),
+                        $src->second());
+      $evdtime = "$tvdate $tvtime";
+      $tvtime = $tvtime.''.$tz;
+    } else {
+      print "Using GMT timezone.\n";
+      my $eyear = $have_y2038 ? $src->year - 1900 : $src->year;
+      my $eptime = timegm( $src->second(),
+                           $src->minute(),
+                           $src->hour(),
+                           $src->day(),
+                           $src->month() - 1,
+                           $eyear);
+
+      $tz = "GMT";
+      $evdtime = strftime("%a %b %e, %Y %R:%S", gmtime($eptime));
+
+      $tvdate = strftime("%a %b %e, %Y", gmtime($eptime));
+      $tvtime = strftime("%R:%S $tz", gmtime($eptime));
+    }
+  } else {
+    my $eyear = $have_y2038 ? $src->year - 1900 : $src->year;
+    my $eptime = timegm( $src->second(),
+                         $src->minute(),
+                         $src->hour(),
+                         $src->day(),
+                         $src->month() - 1,
+                         $eyear);
+    $evdtime = strftime("%a %b %e, %Y %r", localtime($eptime));
+    $tz = timezone($eptime);
+    $tvtime = strftime("%r $tz", localtime($eptime));
+    $tvdate = strftime("%a %b %e, %Y", localtime($eptime));
+  }
+
+  my ($header_sup, $header_sub, $title0, $title1, $title2);
+  my $latlon;
+
+  #$latlon = ($src->lat() < 0) ? "S":"N";
+  $latlon .= sprintf "%.2f", abs $src->lat();
+  $latlon .= ($src->lat() < 0) ? "LS ":"LU ";
+  #$latlon .= ($src->lon() < 0) ? " W":" E";
+  $latlon .= sprintf "%.2f", abs $src->lon();
+  $latlon .= ($src->lon() < 0) ? "BB":"BT";
+
+  if ($scenario) {
+    #-----------------------------------------------------------------------
+    # Sub- and Super-title for scenarios
+    #-----------------------------------------------------------------------
+    $header_sup = "-- Earthquake Planning Scenario --";
+    $title0 = "$title_x $title_supy $main_title_size 0 0 6 $header_sup\n";
+    $header_sub = sprintf("Scenario Date: $evdtime, M:%.1f, $latlon, "
+    #$header_sub = sprintf("Scenario Date: $evdtime $tz   M %.1f   $latlon   "
+                        . "Kedlmn:%.0fkm", 
+                          $src->mag(), 
+			  $src->depth());
+  } else {
+    #-----------------------------------------------------------------------
+    # Sub-title for real earthquakes
+    #-----------------------------------------------------------------------
+    $header_sub = sprintf("$evdtime, M:%.1f, $latlon, Kedlmn:%.0fkm, "
+	    #$header_sub = sprintf("$evdtime $tz   M %.1f   $latlon   Depth: %.1fkm   "
+	                . "", 
+                          $src->mag(), 
+			  $src->depth());
+			  #$src->id());
+  }
+  $title2 = "$title_x $title_suby $sub_title_size 0 0 6 $header_sub\n";
+  #-----------------------------------------------------------------------
+  # Now we make the plot titles 
+  #-----------------------------------------------------------------------
+  my @titleps;
+  $command = "$gmt_bin/pstext -JX$xymax[1]/$width -R0/$xymax[1]/0/$width "
+	   . "-N -O -K";
+  foreach my $file ( @grdfiles ) {
+    ($display) = $file =~ /.+\/output\/(.+)\.grd/;
+    if (not defined $title{$display}) {
+      Print "Error: unknown display $display while making titles"; 
+      next;
+    }
+
+    my $pobj = new Pipe2($command)
+	or Die "Couldn't pipe2 command:\n$command\n";
+
+    if ($scenario) {
+      $title1    = "$title_x $title_y $main_title_size 0 0 6 "
+	         . "$title{$display} $header_main\n";
+      $pobj->println($title0, $title1, $title2);
+    } else {
+      $title1 = "$title_x $title_y $main_title_size 0 0 6 $organization "
+	      . "$title{$display} $header_main\n";
+      $pobj->println($title1, $title2);
+    }
+    $pobj->read($ps{TITLES}->{$display} = []);
+  }
+
+  #-----------------------------------------------------------------------
+  # Plot the city locations and names -- try the formatted version first,
+  # then the generic version
+  #-----------------------------------------------------------------------
+  if (defined $map_cities_label and -e $map_cities_label) {
+    plot_cities($map_cities_label, $ps{CITIES} = [], 1, 0, $width, $xymax[1]);
+  } elsif (defined $map_cities and -e $map_cities) {
+    plot_cities($map_cities, $ps{CITIES} = [], 0, 0, $width, $xymax[1]);
+  }
+
+  #-----------------------------------------------------------------------
+  # Draw the epicenter
+  #-----------------------------------------------------------------------
+  my $epipen;
+  if ($src->mag() < 6.0) {
+    $epipen = "-W6/255/0/0"
+  } else {
+    $epipen = "-W6/0"
+  }
+  if (defined $epicenter_color) {
+    $command  = sprintf "$echo %f %f | $gmt_bin/psxy $gmtflags "
+                      . "-Sa$epicenter_size $epipen -G$epicenter_color "
+                      . "-L -O -K",
+		      $src->lon(), $src->lat();
+  } else {
+    $command  = sprintf "$echo %f %f | $gmt_bin/psxy $gmtflags "
+                      . "-Sa$epicenter_size $epipen -L -O -K",
+		      $src->lon(), $src->lat();
+  }
+  slurp($command, $ps{EPICENTER});
+    
+  my $user_text = "";
+  if (-e "$datadir/timestamp_text.txt") {
+    if (open USER, "< $datadir/timestamp_text.txt") {
+      $user_text = <USER>;
+      close USER;
+    } else {
+      Print "Can't open '$datadir/timestamp_text.txt";
+    }
+  }
+  #-----------------------------------------------------------------------
+  # Write the timestamp
+  #-----------------------------------------------------------------------
+  my $now        = time;
+  my $start_time = strftime("%a %b %e, %Y %H:%M:%S ", localtime($now) );
+  #my $start_time = strftime("%a %b %e, %Y %r", localtime($now));
+  #$tz = "GMT";
+  $tz = timezone($now);
+  if ($scenario) {
+    my $text = "0 -1.143 10 0 0 5 PLANNING SCENARIO ONLY -- "
+     		#. "Map Version $version Processed $start_time$tz ";
+		. "Map Version $version";
+	     	#. "Map Version $version Processed $start_time $tz $user_text";
+    $text = '"' . $text . '"';
+    $command = "$echo $text | $gmt_bin/pstext -JX$xymax[1]/$width "
+	     . "-R0/$xymax[1]/0/$width -N -O -K";
+    slurp($command, $ps{TIMESTAMP});
+  } elsif ($timestamp) {
+    my $text = "";
+    		#."" ;
+    $text = '"' . $text . '"';
+    $command = "$echo $text | $gmt_bin/pstext -JX$xymax[1]/$width "
+	     . "-R0/$xymax[1]/0/$width -N -O -K";
+    slurp($command, $ps{TIMESTAMP});
+  } 
+
+  #-----------------------------------------------------------------------
+  # Write the big "SCENARIO" 
+  #-----------------------------------------------------------------------
+  if ($scenario and !$noscenariosplash) {
+    my $angle = 180.0 * atan2($xymax[1], $xymax[0]) / 3.141592654;
+    my $x = $xymax[0] / 2;
+    my $y = $xymax[1] / 2;
+	my $text  = "$x $y 60 $angle 1 6 SCENARIO";
+    # my $text  = "$x $y 60 $angle 1 6 BMKG SCENARIO";
+    $command = "$echo $text | $gmt_bin/pstext -JX$xymax[1]/$width "
+	     . "-R0/$xymax[1]/0/$width -N -S4 -O -K";
+    slurp($command, $ps{SCENARIO});
+
+    #-----------------------------------------------------------------------
+    # Fix a bug in pstext that fills in the text no matter what
+    #-----------------------------------------------------------------------
+    my $gcount = grep /SCENARIO/, @{$ps{SCENARIO}};
+    if ($gcount > 1) {
+      my $skip = 0;
+      for (my $i = 0; $i < @{$ps{SCENARIO}}; $i++) {
+        if ($ps{SCENARIO}->[$i] =~ /SCENARIO/) {
+	  if ($skip lt 2) { $skip++; next; }
+	  $ps{SCENARIO}->[$i]=~ s/^/%/;
+	}
+      }
+    }
+  }
+    
+  #-----------------------------------------------------------------------
+  # Make the scalebar (with and without closing PostScript)
+  #-----------------------------------------------------------------------
+  my $epilat    = $src->lat();
+  my $sb_offset = $width * 2.54 / 16.51;
+  my $sb_length = 400;
+  $sb_length = 300 if ($lonspan < 15);
+  $sb_length = 150 if ($lonspan < 12);
+  $sb_length = 100 if ($lonspan < 8);
+  $sb_length = 50  if ($lonspan < 5);
+  $sb_length = 30  if ($lonspan < 2.0);
+  $sb_length = 10  if ($lonspan < 1.2);
+  $sb_length = 8   if ($lonspan < 0.6);
+  my $sb        = "-Lfx$sb_offset/1.00/$epilat/${sb_length}+l";
+  $command = "$gmt_bin/psbasemap $gmtflags -B${ticks} $sb -O";
+  slurp($command, $ps{CLOSE});
+
+  if ($gsm and defined $map_topo and -e $map_topo) {
+    print "Using topo file $map_topo, disabling -gsm.\n";
+    $gsm = 0;
+  }
+
+  #-----------------------------------------------------------------------
+  # Global ShakeMap Code - Create topography data from DEM
+  #-----------------------------------------------------------------------
+  if ($gsm) {
+    Print "Creating topography files.\n" if ($verbose);
+    $map_topo = "$outputdir/topo_data.grd";
+    $map_intensity = "$outputdir/intens_data.grd";
+  
+    my $res = '30c';
+    $res = "2m" if ($lonspan > 6);
+    $res = "5m" if ($lonspan > 10);
+    $res = "10m" if ($lonspan > 15);
+    my $topobin = "$shake_home/bin/topo2grd $evid $map_bound $res regime=active 1";
+    #Print $topobin;
+    system "$topobin";
+    #system "cd $DEMdir; $DEMdir/dem2grd.pl $map_bound $DEMdir/$evid.$$ $res";
+    #system "mv $DEMdir/$evid.$$.grd $map_topo";
+    Print "Topography file created.\n" if ($verbose);
+  }
+
+
+  #-----------------------------------------------------------------------
+  # Create cut versions of the topo and intensity files in the local
+  # directory -- we'll remove them later
+  #-----------------------------------------------------------------------
+
+  #-----------------------------------------------------------------------
+  # Can't do anything if there is no topography data at the selected
+  # resolution.
+  #-----------------------------------------------------------------------
+  if ((not $hires and defined $map_topo and -e $map_topo) 
+   or ($hires and defined $map_topo_hires and -e $map_topo_hires)) {
+    my ($topo_data, $inten_data);
+    #-----------------------------------------------------------------------
+    # If the intensity grid (for the topography) does not exist, we make
+    # it and leave it in a directory with the topo grid
+    #-----------------------------------------------------------------------
+    if ($hires) {
+      $topo_data  = $map_topo_hires;
+      $xres = $mi_xhires;
+      $yres = $mi_yhires;
+      if (defined $map_intensity_hires) {
+        $inten_data = $map_intensity_hires;
+      } else {
+        $inten_data = "$map_data_dir/intensity_hires.grd";
+      }
+    } else {
+      $topo_data  = $map_topo;
+      $xres = $mi_xres;
+      $yres = $mi_yres;
+      if (defined $map_intensity) {
+        $inten_data = $map_intensity;
+      } else {
+        $inten_data = "$map_data_dir/intensity.grd";
+      }
+    }
+    if (not -e $inten_data) {
+      if ($gsm) {
+        #---------------------------------------------------------------------
+        # The Global ShakeMap version of the command is somewhat different: 
+        #---------------------------------------------------------------------
+        $command = "$gmt_bin/grdgradient $topo_data -A45 -G$inten_data -Ne0.6";
+      } else {
+        $command = "$gmt_bin/grdgradient $topo_data -A325 -G$inten_data -Nt";
+      }
+      print "Making topo intensity file :\n$command..." if $verbose;
+      `$command`;
+      print "done.\n" if $verbose;
+    }
+    #-----------------------------------------------------------------------
+    # Now cut the topo and intensity grids to size and deposit them in
+    # the mapping directory
+    #-----------------------------------------------------------------------
+
+    $command = "$gmt_bin/grdsample $topo_data -G$outputdir/topo.grd "
+             . "-I$xres/$yres -R$map_bound";
+    print "Running: $command\n" if $verbose;
+    `$command`;
+    $command = "$gmt_bin/grdsample $inten_data -G$outputdir/inten.grd "
+	     . "-I$xres/$yres -R$map_bound";
+    print "Running: $command\n" if $verbose;
+    `$command`;
+  } else {
+    Print "WARNING: no topography data found; will continue without topo."
+  }
+
+  #-----------------------------------------------------------------------
+  # Make maps: contours or imagemap
+  #-----------------------------------------------------------------------
+  my ($cmap, $flags);
+  foreach my $file ( @grdfiles ) {
+    ($display) = $file =~ /.+\/output\/(.+)\.grd/;
+
+    -e $file or Die "Couldn't find $file";
+    my $ghd = new GMThd($file, $gmt_bin);
+
+    if ($display eq 'mi') {
+      $xres = $hires ? $mi_xhires : $mi_xres;
+      $yres = $hires ? $mi_yhires : $mi_yres;
+      my $migrdfile = "${file}";
+      #-----------------------------------------------------------------------
+      # Resample the mi file as needed...
+      #-----------------------------------------------------------------------
+      if ($ghd->xinc() > get_deg($xres)
+       or $ghd->yinc() > get_deg($yres)) {
+	#-------------------------------------------------------------------
+	# Make finer: use grdsample
+	#-------------------------------------------------------------------
+	$migrdfile = "$outputdir/tmp_mi.grd";
+	printf("Sampling to a finer grid; old: %f/%f new: $xres/$yres\n", 
+	       $ghd->xinc(), $ghd->yinc()) if $verbose;
+
+        $command = "$gmt_bin/grdsample ${file} -G$migrdfile "
+	         . "-I$xres/$yres";
+        print "Running: $command\n" if $verbose;
+        `$command`;
+      } elsif ($ghd->xinc() < get_deg($xres)
+            or $ghd->yinc() < get_deg($yres)) {
+	#-------------------------------------------------------------------
+	# Make coarser: use nearneighbor
+	#-------------------------------------------------------------------
+	$migrdfile = "$outputdir/tmp_mi.grd";
+	printf("Sampling to a coarser grid; old: %f/%f new: $xres/$yres\n", 
+		$ghd->xinc(), $ghd->yinc()) if $verbose;
+
+	my $radius = get_deg($xres) > get_deg($yres)
+		   ? $xres : $yres;
+	$command = "$gmt_bin/grd2xyz ${file} -b | "
+		 . "$gmt_bin/nearneighbor -b -G$migrdfile "
+		 . "-S$radius -I$xres/$yres -N1 -R$map_bound";
+        print "Running: $command\n" if $verbose;
+        print "Intensity:\n$command\n" if ($verbose);
+        `$command`;
+      }
+      #-----------------------------------------------------------------------
+      # Make the mi and tvmi plots
+      #-----------------------------------------------------------------------
+      foreach my $iitype ( 'mi', 'mi_tv' ) {
+	$cmap = $iitype eq 'mi' ? $ii_cmap : $ii_tvmap_cmap;
+	if ($iitype eq 'mi') {
+          $flags = "-P -R${map_bound}/10/3000 -JM$width";
+	} else {
+          $flags = "-P -R${map_bound}/10/3000 -JM$tvwidth";
+	}
+        #---------------------------------------------------------------------
+        # Make an image file for the Intensity plot -- use the topography if it
+	# is there.
+        #---------------------------------------------------------------------
+        if ($itopo and -e "$outputdir/topo.grd" 
+		   and -e "$outputdir/inten.grd") {
+          $command = "$gmt_bin/grdview $outputdir/topo.grd $flags -JZ1 "
+		   . "-G$migrdfile -C$cmap -I$outputdir/inten.grd "
+		   . "-Qi72 -O -K";
+        } else {
+	  Print "WARNING: can't find topo data: making mi without topography"
+	    if $itopo;
+          $command = "$gmt_bin/grdimage $migrdfile $flags -C$cmap "
+		   . "-O -K";
+        }
+	if ($iitype eq 'mi') {
+          slurp($command, $migrd);
+	} else {
+          slurp($command, $mitvgrd);
+	}
+      }
+    } elsif  ($display =~ /urat_pga/) {
+      #-----------------------------------------------------------------------
+      # Make image map for SD
+      #-----------------------------------------------------------------------
+      $command = "$gmt_bin/grdimage ${file} $gmtflags -C$sd_cmap "
+           . "-O -K";
+      $params{$display} = [];
+      slurp($command, $params{$display});
+    
+      # SD Color Bar
+      $command = "$gmt_bin/psscale -C$sd_cmap.legend.no1 -D6.7i/2.75i/5.00i/0.2i "
+           . "-O -K";
+      slurp($command, $params{$display});
+      $command = "$gmt_bin/psscale -Bp -C$sd_cmap.legend -D6.7i/2.75i/5.00i/0.2i "
+           . "-O -K";
+      slurp($command, $params{$display});
+      $command = "$gmt_bin/psscale -C$sd_cmap.legend.0 -D6.7i/0.1i/0.2i/0.2i "
+           . "-O -K";
+      slurp($command, $params{$display});
+
+      # SD annotations
+        my %annot = ( A => 1.524, B => 2.845, C => 4.318, D => 8.636, 
+                      F => 12.446 );
+  
+        foreach my $grade (keys %annot) {
+          $command = "echo 17.145 $annot{$grade} 12 0 1 5 $grade "
+          . " | $gmt_bin/pstext "
+          . "-JX$xymax[1]/$width -R0/$xymax[1]/0/$width -N -O -K";
+          slurp($command, $params{$display});
+        }
+    } else {
+      #-----------------------------------------------------------------------
+      # Make contours for everything except Intensity (i.e. PGA, PGV, SP_??)
+      #-----------------------------------------------------------------------
+      my $cont_int = cont_scale($ghd->zmax() - $ghd->zmin());
+      my $surf_ll  = $cont_int / 2;
+      if ($cont_int == 0) {
+        print "Warning: No data in grid. Skipping contour.\n";
+      } else {
+        $command = "$gmt_bin/grdcontour ${file} $gmtflags -C$cont_int "
+	         . "-W$cont_width/$cont_color -Af12/$cont_color "
+	         . "-D$outputdir/cont_${display}.dat -Q8 $mflag "
+	         . "-L$surf_ll/9999 -O -K";
+        $params{$display} = [];
+        slurp($command, $params{$display});
+      }
+    }
+  }
+
+  #-----------------------------------------------------------------------
+  # For each of the parameters we're mapping (except Intensity), we plot the
+  # stations; we also need a list of coordinates for the
+  # imagemap
+  #-----------------------------------------------------------------------
+
+  #-----------------------------------------------------------------------
+  # imgobj gets the coordinates of the stations and projects them
+  # (with mapproject) onto the map (in inches) for conversion to pixels
+  # that can be used in the imagemap
+  #-----------------------------------------------------------------------
+  $command = "$gmt_bin/mapproject -JM$width -R$map_bound";
+
+  my $imgobj = new Pipe2($command, "$outputdir/.tmpfile")
+	  or Die "Couldn't pipe2 command:\n$command\n";
+  print "Running: $command\n" if $verbose;
+
+  #-----------------------------------------------------------------------
+  # locobj gets the coordinates of the stations and plots an open
+  # triangle at each position
+  #-----------------------------------------------------------------------
+  $command = "$gmt_bin/psxy $gmtflags -S -W1 -L -O -K";
+  $locobj  = new Pipe2($command, "$outputdir/.tmpfile2")
+	  or Die "Couldn't pipe2 command:\n$command\n";
+  print "Running: $command\n" if $verbose;
+
+  #-----------------------------------------------------------------------
+  # The 'sta_lists' array references will hold lists of stations (that are
+  # not flagged out of existence) to be plotted as filled (with the 
+  # appropriate network color) triangles; $ps{STATIONS}->{$param} will
+  # hold the PostScript of the stations to be plotted with each parameter;
+  # we initialize both because they get handed to functions
+  #-----------------------------------------------------------------------
+  my %sta_lists;
+  foreach my $param ( keys %params ) {
+    $ps{STATIONS}->{$param} = [];
+    foreach my $network ( keys %net_color, keys %sta_color ) {
+      $sta_lists{$param}{$network} = [];
+    }
+  }
+
+  #-----------------------------------------------------------------------
+  # Write an open triangle for every station in the list; then for
+  # each parameter, fill the list of stations to be plotted as filled
+  # triangles; also write the coordinates to the mapproject pipe
+  #-----------------------------------------------------------------------
+  my $network;
+  my ($ncp, $c, $size, $symbol, $ii);
+  my $sta_arr = $data->stations();
+  for (my $i = 0; $i < @$sta_arr; $i++) {
+    print "Plotting station $i.\n" if ($scenario and ($i%100)==0);
+    $sta = $sta_arr->[$i];
+    $lon = $sta->lon();
+    $lat = $sta->lat();
+    $network = $sta->netid();
+    if (defined $network and defined ($ncp = $net_color{$network})) {
+      if (defined ($c = $ncp->{size})) {
+        $size = $c;
+      }
+      if (defined ($c = $ncp->{symbol})) {
+        $symbol = $c;
+      }
+    }
+    $network = $sta->agency() if (not defined $network or $network eq ""
+                                   or not defined $net_color{$network});
+    $size = $sta_size if not defined $size;
+    $symbol = $sta_symbol if not defined $symbol;
+
+    Die "No \$lat or \$lon data in stationlist" unless ($lon and $lat);
+
+    #-----------------------------------------------------------------------
+    # The output of mapproject must correspond one-for-one with
+    # the station array, so rather than do a tricky two-index thing
+    # when we write them out below, we just project all of the stations 
+    # here, before the lat/lon test a couple of lines below...
+    #-----------------------------------------------------------------------
+    $imgobj->println("$lon $lat\n");
+
+    #-----------------------------------------------------------------------
+    # No point in plotting a bunch of stations that won't show up
+    #-----------------------------------------------------------------------
+    next if $lon < $lonmin or $lon > $lonmax
+         or $lat < $latmin or $lat > $latmax;
+  
+    $locobj->println("$lon $lat $size $symbol\n");
+    foreach my $param ( keys %params ) {
+      if (not grep $param eq $_, keys %title) {
+	Print "Error: unknown parameter $param while plotting stations";
+	next;
+      }
+      my $pp = $param eq 'urat_pga' ? 'pga' : $param;
+      if ($fill_pgm_intensity and $param ne 'urat_pga') {
+        if ($network eq 'CIIM' or $network eq 'MMI' or
+            $network eq 'DYFI' or $network eq 'INTENSITY') {
+          $ii = $sta->intensity();
+        } else {
+          if (not defined $pinten{$sta->code()}) {
+            $ii = 'NaN' 
+          } else {
+            $ii = $pinten{$sta->code()}[$p2ix{$param}];
+          }
+        }
+	push @{$sta_lists{$param}{DEFAULT}},"$lon $lat $ii $size $symbol\n"
+			if ($ii !~ /NaN/i);
+      } else {
+        if ($sta->peak($pp) !~ /NaN/i) {
+          $network = 'DEFAULT' if not defined $sta_lists{$pp}{$network};
+	  push @{$sta_lists{$param}{$network}}, "$lon $lat $size $symbol\n";
+        }
+      }
+    }
+  }
+  print "Done plotting stations." if ($verbose);
+  #-----------------------------------------------------------------------
+  # Now suck up the imagemap and station location data we just wrote
+  #-----------------------------------------------------------------------
+  $imgobj->close();
+  $locobj->close();
+  my @sta_coor;
+  $imgobj->read(\@sta_coor);
+  $locobj->read($ps{STA_LOCS} = []);
+
+  my $tmpcpt = "$outputdir/.tmp.cpt";
+  `$gmt_bin/makecpt -C$ii_cmap -T1/13/0.1 -Z > $tmpcpt`;
+  foreach my $param ( keys %params ) {
+    if ($fill_pgm_intensity and $param ne 'urat_pga') {
+      $command = "$gmt_bin/psxy $gmtflags -S -C$tmpcpt -O -K";
+      print "Running: $command\n" if $verbose;
+      my $p = new Pipe2($command, "$outputdir/.tmpfile")
+		or Die "Couldn't pipe2 command:\n$command\n";
+      $p->printarr($sta_lists{$param}{DEFAULT});
+      $p->read($ps{STATIONS}->{$param});
+    } else {
+      #-----------------------------------------------------------------------
+      # For each of the param/network combinations, write the station list
+      #   and catch the output PostScript
+      #-----------------------------------------------------------------------
+      foreach my $network ( sort keys %net_color ) {
+        $command = "$gmt_bin/psxy $gmtflags -S "
+                 . "-G$net_color{$network}{color} -O -K";
+        print "Running: $command\n" if $verbose;
+        my $p = new Pipe2($command, "$outputdir/.tmpfile")
+		  or Die "Couldn't pipe2 command:\n$command\n";
+        $p->printarr($sta_lists{$param}{$network});
+        $p->read($ps{STATIONS}->{$param});
+      }
+      foreach my $network ( keys %sta_color ) {
+        $command = "$gmt_bin/psxy $gmtflags -S -G$sta_color{$network} "
+	         . "-O -K";
+        print "Running: $command\n" if $verbose;
+        my $p = new Pipe2($command, "$outputdir/.tmpfile")
+		  or Die "Couldn't pipe2 command:\n$command\n";
+        $p->printarr($sta_lists{$param}{$network});
+        $p->read($ps{STATIONS}->{$param});
+      }
+    }
+  }
+  unlink $tmpcpt;
+
+  #-----------------------------------------------------------------------
+  # Now we write some auxiliary files used by genex to make GIFs and
+  # imagemaps (all measurements are in inches, coordinates are specified
+  # from the origin of the map (lower left)):
+  #	sta_map.txt	 -  holds station code and x y positions of each
+  #                         of the plotted stations
+  #	evt_map.txt	 -  holds the x y position of the epicenter
+  #	geometry_map.txt -  holds the x/y origin and x/y size of the maps
+  #-----------------------------------------------------------------------
+
+  #-----------------------------------------------------------------------
+  # Make sta_map.txt
+  #-----------------------------------------------------------------------
+  open IMGMAP, "> $outputdir/sta_map.txt" or Die "Couldn't open sta_map.txt";
+  print IMGMAP "# Format: station_code x y  (x and y in cm from origin)\n";
+  for (my $i = 0; $i < @$sta_arr; $i++) {
+    $sta  = $sta_arr->[$i];
+    $lon  = $sta->lon();
+    $lat  = $sta->lat();
+
+    next if $lon < $lonmin or $lon > $lonmax
+         or $lat < $latmin or $lat > $latmax;
+
+    chomp $sta_coor[$i];
+    ($x, $y) = split " ", $sta_coor[$i];
+    printf IMGMAP "%s %.4f %.4f\n", $sta->code(), $x, $y;
+  }
+  close IMGMAP;
+    
+  #-----------------------------------------------------------------------
+  # Project the epicenter then write evt_map.txt
+  #-----------------------------------------------------------------------
+  my @epi_coor;
+  $command  = sprintf "$echo %f %f | $gmt_bin/mapproject -JM$width "
+		    . "-R$map_bound", $src->lon(), $src->lat();
+  slurp($command, \@epi_coor);
+  chomp $epi_coor[0];
+  my ($sx, $sy) = split " ", $epi_coor[0];
+  open EVTMAP, "> $outputdir/evt_map.txt" or Die "Couldn't open evt_map.txt";
+  print EVTMAP "# Epicenter position\n";
+  print EVTMAP "# Format: x y  (x and y in cm from origin)\n";
+  printf EVTMAP "%.4f %.4f\n", $sx, $sy;
+  close EVTMAP;
+
+  #-----------------------------------------------------------------------
+  # Write geometry_map.txt
+  #-----------------------------------------------------------------------
+  open GEOM, "> $outputdir/geometry_map.txt" 
+	or Die "Couldn't open geometry_map.txt";
+  print GEOM "# Map geometry (values are in centimeters)\n";
+  printf GEOM "%.4f %.4f \t# xorig yorig\n", $xorig, $yorig;
+  printf GEOM "%.4f %.4f \t# width height\n", $xymax[0], $xymax[1];
+  printf GEOM "%.4f %.4f \t# tvmap width height\n", $tvxymax[0], $tvxymax[1];
+  printf GEOM "%.4f %.4f \t# iimap width height\n", $iixymax[0], $iixymax[1];
+  close GEOM;
+
+  #-----------------------------------------------------------------------
+  # Make the topo map -- we leave this till last because it's a big
+  # hunk of data to keep forking...
+  #-----------------------------------------------------------------------
+  if (-e "$outputdir/topo.grd" and -e "$outputdir/inten.grd") {
+    $command = "$gmt_bin/grdimage $outputdir/topo.grd $gmtflags -C$topo_cmap "
+      . "-I$outputdir/inten.grd -K -O";
+    slurp($command, $ps{TOPO});
+    unlink("$outputdir/topo.grd");
+    unlink("$outputdir/inten.grd");
+  } else {
+    Print "WARNING: couldn't find topo and intensity data; will continue "
+	. "without topo.";
+  }
+  
+  #-----------------------------------------------------------------------
+  # Now we actually make the maps by catting together the bits of
+  # postscript we've been making
+  #-----------------------------------------------------------------------
+  my @plotlist = $poster ? ( '', '_poster' ) : ( '' );
+  foreach my $param ( keys %params ) {
+    next if @{$params{$param}} <= 0;
+    print "Making $param plot\n" if $verbose;
+    if ($param =~ /psa/) {
+      #-----------------------------------------------------------------------
+      # Make the spectral plots (no posters)
+      #-----------------------------------------------------------------------
+      open FILE, "> $outputdir/${param}.ps";
+      print FILE @{$ps{BASE}}, @{$ps{TOPO}}, @{$ps{HIWAYS}}, 
+	         @{$params{$param}},
+	         @{$ps{COAST}}, @{$ps{XYADDON}}, 
+		 @{$ps{FAULTS}}, @{$ps{FFAULT}},
+		 @{$ps{CENTROID}}, @{$ps{EPICENTER}},
+		 @{$ps{STATIONS}->{$param}}, @{$ps{STA_LOCS}}, 
+		 @{$ps{TEXTADDON}},
+	         @{$ps{TITLES}->{$param}}, @{$ps{TIMESTAMP}}, 
+		 @{$ps{SCENARIO}};
+      if ($fill_pgm_intensity) {
+        my $leg = $milegend;
+        $leg =~ s/scale_/scale_${param}_/;
+        open PGMSCALE, "$psdir/$leg" or Die "Couldn't open $psdir/$leg";
+        my @pgmlegend = <PGMSCALE>;
+        close PGMSCALE;
+        print FILE @pgmlegend;;
+      }
+      print FILE @{$ps{CLOSE}};
+      close FILE or Print "Error closing file $outputdir/${param}.ps";
+    } elsif ($param =~ /urat_pga/) {
+      #-----------------------------------------------------------------------
+      # Make sd plots
+      #-----------------------------------------------------------------------
+      foreach my $plottype ( @plotlist ) {
+        my $file = "$outputdir/${param}${plottype}.ps";
+        open FILE, "> $file" or Die "Can't open $file for writing";
+        if ( $plottype eq '_poster' ) {
+          for (my $i = 0; $i < @{$ps{BASE}}; $i++) {
+            my $line = $ps{BASE}->[$i];
+            chomp $line;
+            $line = '1.0 1.0 scale' if $line eq '0.24 0.24 scale';
+            $line = '%%BoundingBox: 0 0 2592 3456' if $line =~ /BoundingBox/;
+            $line = 'PSLevel 1 gt { << /PageSize [2592 3456] '
+                  . '/ImagingBBox null >> setpagedevice } if'
+               if $line =~ /PageSize/;
+            print FILE "$line\n";
+          }
+        } else {
+          print FILE @{$ps{BASE}};
+        }
+
+        #---------------------------------------------------------------------
+        # Intensity 6 contour for sd plot
+        #---------------------------------------------------------------------
+        my $params_mi = [];
+        my $cont_int = 1.0;
+        my $surf_ll  = $cont_int / 2;
+        my $line_width = 20;
+        my $ghd = new GMThd("$inputdir/mi.grd", $gmt_bin);
+        if ($ghd->zmax() > 6) {
+          $command = "$gmt_bin/grdcontour $inputdir/mi.grd $gmtflags -C6 "
+                 . "-W$line_width/0 -A- "
+                 . "-Q50 $mflag "
+                 . "-L$surf_ll/9999 -O -K";
+          print "$command\n" if $verbose;
+          slurp($command, $params_mi);
+        }
+
+        my $annot_mi = [];
+        my $annot_x = $width - 5.08;
+        my $annot_y = 0.508;
+        my $xmax = $width + $xorig;
+
+        # SD letter grade
+
+        my $info = new Info($evid,'read');
+        my $grade  = $info->value('grade');
+        my $mean_sd = sprintf "%.3f", $info->value('mean_uncertainty');
+
+        if ($grade and $mean_sd) {
+          print "Printing grade $grade ($mean_sd)\n";
+          $mean_sd = '-' if ($grade eq '-');
+          my $text = "0.508 0.635 12 0 1 5 "
+             . "GRADE: $grade (Mean sigma: $mean_sd)";
+          $command = "echo  '$text' | $gmt_bin/pstext -JX$xmax/$xymax[1] "
+             . "-R0/$xmax/0/$xymax[1] -C.05i -W255o4/0 -N -O -K ";
+          slurp($command, $annot_mi);
+        }
+
+        # Draw the legend box
+
+        my ($x1,$y1,$x2,$y2) = ( $annot_x,       $annot_y + 0.254,
+                                 $annot_x + 4.2, $annot_y - 0.254);
+        $command = "$gmt_bin/psxy -JX$xmax/$xymax[1] -R0/$xmax/0/$xymax[1] "
+          . "-W4/0 -G255 -O -K -N ";
+        my $pobj = new Pipe2($command) or Die "Couldn't pipe2 command:\n$command\n";
+        #print "$x1 $y1\n$x2 $y1\n$x2 $y2\n$x1 $y2\n$x1 $y1\n";
+        $pobj->println("$x1 $y1\n$x2 $y1\n$x2 $y2\n$x1 $y2\n$x1 $y1\n");
+        $pobj->read($annot_mi);
+
+        # Write the legend text
+
+        my $text = ($annot_x + 2.1) . " $annot_y 12 0 1 5 MI = 6.0";
+        $command = "echo  '$text' | $gmt_bin/pstext -JX$xmax/$xymax[1] "
+             . "-R0/$xmax/0/$xymax[1] -N -O -K ";
+        slurp($command, $annot_mi);
+
+        # Draw the legend line
+
+        $command = "$gmt_bin/psxy -JX$xmax/$xymax[1] -R0/$xmax/0/$xymax[1] "
+          . "-W$line_width/0 -O -K";
+        $pobj = new Pipe2($command) or Die "Couldn't pipe2 command:\n$command\n";
+        $pobj->println(sprintf "%.2f $annot_y\n%.2f $annot_y\n",
+          $annot_x + 0.254, $annot_x + 1.8);
+        $pobj->read($annot_mi);
+
+        print FILE @{$params{$param}}, @{$ps{HIWAYS}}, @{$params{pga}}, @$params_mi,
+                   @{$ps{COAST}}, @{$ps{XYADDON}},
+                   @{$ps{FAULTS}}, @{$ps{FFAULT}},
+                   @{$ps{CENTROID}}, @{$ps{EPICENTER}},
+                   @{$ps{STATIONS}->{urat_pga}}, @{$ps{STA_LOCS}},
+                   @{$ps{TEXTADDON}},
+                   @{$ps{TITLES}->{$param}}, @{$ps{TIMESTAMP}}, @$annot_mi,
+                   @{$ps{SCENARIO}}, @{$ps{CLOSE}};
+        close FILE or Print "Error closing file $file";
+      }
+    } else {
+      #-----------------------------------------------------------------------
+      # Make pga and pgv plots
+      #-----------------------------------------------------------------------
+      foreach my $plottype ( @plotlist ) {
+	my $file = "$outputdir/${param}${plottype}.ps";
+        open FILE, "> $file" or Die "Can't open $file for writing";
+	if ( $plottype eq '_poster' ) {
+          for (my $i = 0; $i < @{$ps{BASE}}; $i++) {
+            my $line = $ps{BASE}->[$i];
+	    chomp $line;
+	    $line = '1.0 1.0 scale' if $line eq '0.24 0.24 scale';
+            $line = '%%BoundingBox: 0 0 2592 3456' if $line =~ /BoundingBox/;
+            $line = 'PSLevel 1 gt { << /PageSize [2592 3456] '
+                  . '/ImagingBBox null >> setpagedevice } if' 
+               if $line =~ /PageSize/;
+	    print FILE "$line\n";
+          }
+	} else {
+	  print FILE @{$ps{BASE}};
+	}
+        print FILE @{$ps{TOPO}}, @{$ps{HIWAYS}}, @{$params{$param}},
+		   @{$ps{COAST}}, @{$ps{XYADDON}}, 
+		   @{$ps{FAULTS}}, @{$ps{FFAULT}}, 
+		   @{$ps{CENTROID}}, @{$ps{EPICENTER}},
+		   @{$ps{STATIONS}->{$param}}, @{$ps{STA_LOCS}}, 
+		   @{$ps{TEXTADDON}},
+	           @{$ps{TITLES}->{$param}}, @{$ps{TIMESTAMP}}, 
+                   @{$ps{SCENARIO}}; 
+        if ($fill_pgm_intensity) {
+          my $leg = $milegend;
+          $leg =~ s/scale_/scale_${param}_/;
+          open PGMSCALE, "$psdir/$leg" or Die "Couldn't open $psdir/$leg";
+          my @pgmlegend = <PGMSCALE>;
+          close PGMSCALE;
+          print FILE @pgmlegend;;
+        }
+        print FILE @{$ps{CLOSE}};
+        close FILE or Print "Error closing file $file";
+      }
+    }
+  }
+
+  if (@{$migrd} > 0) {
+    print "Making mi plot\n" if $verbose;
+    #-----------------------------------------------------------------------
+    # Make the Intensity plot with attached Intensity scale
+    #-----------------------------------------------------------------------
+    open MISCALE, "$psdir/$milegend" 
+		or Die "Couldn't open $psdir/$milegend";
+    my @milegend = <MISCALE>;
+    close MISCALE;
+    foreach my $plottype ( @plotlist ) {
+      $file = "$outputdir/intensity${plottype}.ps";
+      open FILE, "> $file";
+      if ($plottype eq '_poster') {
+        for (my $i = 0; $i < @{$ps{ISB_BASE}}; $i++) {
+          $line = $ps{ISB_BASE}->[$i];
+	  chomp $line;
+	  $line = '1.0 1.0 scale' if $line eq '0.24 0.24 scale';
+          $line = '%%BoundingBox: 0 0 2592 3456' if $line =~ /BoundingBox/;
+          $line = 'PSLevel 1 gt { << /PageSize [2592 3456] '
+                . '/ImagingBBox null >> setpagedevice } if' 
+             if $line =~ /PageSize/;
+	  print FILE "$line\n";
+        }
+      } else {
+	print FILE @{$ps{ISB_BASE}};
+      }
+      print FILE @{$migrd}, @{$ps{HIWAYS}}, @{$ps{COAST}}, @{$ps{XYADDON}};
+      print FILE @{$ps{FAULTS}}          if $faults_on_mi; 
+      print FILE @{$ps{FFAULT}};
+      print FILE @{$ps{STATIONS}->{pgv}} if $filled_stations_on_mi; 
+      print FILE @{$ps{STA_LOCS}}        if $filled_stations_on_mi or 
+				            $stations_on_mi;
+      print FILE @{$ps{EPICENTER}}, @{$ps{CITIES}}, @{$ps{TEXTADDON}},
+	         @{$ps{TITLES}->{'mi'}}, @{$ps{TIMESTAMP}}, @{$ps{SCENARIO}},
+		 @milegend, @{$ps{CLOSE}};
+      close FILE or Print "Error closing file $file";
+    }
+    print "Done with mi plot\n" if $verbose;
+  }
+
+  #------------------------------------------------------------------------
+  # Making TV map
+  #------------------------------------------------------------------------
+    print "Making tvmap\n" if $verbose;
+    `$gmt_bin/gmtset BASEMAP_TYPE PLAIN FRAME_PEN 10`;
+    if ($PaperRegion =~ /US/i) {
+      `$gmt_bin/gmtset PAPER_MEDIA $PAPER{tvmap_us}->{name}`;
+    } elsif ($PaperRegion =~ /EU/i) {
+      `$gmt_bin/gmtset PAPER_MEDIA $PAPER{tvmap_eu}->{name}`;
+    } else {
+      Die "Error: unknown region for paper type: $PaperRegion\n";
+    }
+    $command = "$gmt_bin/psbasemap $tvgmtflags -Bwesn -X$xorig -Y$yorig -K";
+    slurp($command, $ps{TV_BASE});
+    if (defined $map_roads and -e $map_roads) {
+      $command = "$gmt_bin/psxy $map_roads $tvgmtflags $mflag "
+	       . "-W$tv_highway_width/$tv_highway_color -O -K";
+      slurp($command, $ps{TV_HIWAYS});
+    }
+    if ($use_gmt_coast eq 'true') {
+      $command = "$gmt_bin/pscoast $tvgmtflags "
+	       . "-Na/$tv_border_width/$colors{'grey'} "
+	       . "-Df -W$tv_border_width/$colors{'grey'} -S$water_color -O -K";
+      slurp($command, $ps{TV_COAST});
+    }
+
+    #-----------------------------------------------------------------------
+    # Check for fault files in the input/ directory.
+    #-----------------------------------------------------------------------
+
+    @faultfiles = <$datadir/*_fault.txt>;
+    foreach (@faultfiles) {
+      $command = "$gmt_bin/psxy $tvgmtflags -: $_ "
+               . "-W$ff_width/$ff_color -O -K";
+
+      # Need to check if fault file has the '>' delimiter.
+      open IN_FAULT,$_;
+      while (<IN_FAULT>) {
+        if (/>/) { $command .= " $mflag"; last; }
+      }
+      close IN_FAULT;
+      slurp($command, $ps{TV_FFAULT});
+    }
+  
+    #-----------------------------------------------------------------------
+    # Read the TV scalebar
+    #-----------------------------------------------------------------------
+    open(SCALEFH, "$psdir/$tvmilegend") 
+      or Die "Couldn't open scalebar file $psdir/$tvmilegend";
+    @{$ps{TV_SCALE}} = <SCALEFH>;
+    close SCALEFH;
+
+    #-----------------------------------------------------------------------
+    # Plot the city locations and names
+    #-----------------------------------------------------------------------
+    if ($lonspan <  4.0 and defined $big_cities_label 
+		 	     and -e $big_cities_label) {
+      plot_cities($big_cities_label, $ps{TV_CITIES}, 1, 1, 
+		  $tvwidth, $tvxymax[1]);
+    } elsif ($lonspan >= 4.0 and defined $very_big_cities_label 
+				  and -e $very_big_cities_label) {
+      plot_cities($very_big_cities_label, $ps{TV_CITIES}, 1, 1, 
+		  $tvwidth, $tvxymax[1]);
+    } elsif ($lonspan <  4.0 and defined $big_cities and -e $big_cities) {
+
+      plot_cities($big_cities, $ps{TV_CITIES}, 0, 1, 
+		  $tvwidth, $tvxymax[1]);
+    } elsif ($lonspan >= 4.0 and defined $very_big_cities 
+						  and -e $very_big_cities) {
+      plot_cities($very_big_cities, $ps{TV_CITIES}, 0, 1, 
+		  $tvwidth, $tvxymax[1]);
+    }
+
+    #-----------------------------------------------------------------------
+    # Add user-defined drawing and text
+    #-----------------------------------------------------------------------
+    foreach my $h ( @xyinfo ) {
+      $command = "$gmt_bin/psxy $map_data_dir/$h->{'FILE'} $tvgmtflags -K -O "
+	       . "$h->{'FLAGS'}";
+      slurp($command, $ps{TV_XYADDON});
+    }
+  
+    foreach my $h ( @textinfo ) {
+      $command = "$gmt_bin/pstext $map_data_dir/$h->{'FILE'} $tvgmtflags "
+	       . "-K -O $h->{'FLAGS'}";
+      slurp($command, $ps{TV_TEXTADDON});
+    }
+  
+    #-----------------------------------------------------------------------
+    # Make the plot title
+    #-----------------------------------------------------------------------
+    my $tv_title_y = $tvxymax[1] - 0.406;
+    my $tv_title_x = $tvwidth / 2;
+    $command = "$gmt_bin/pstext -JX$tvxymax[1]/$tvwidth "
+	     . "-R0/$tvxymax[1]/0/$tvwidth "
+	     . "-N -W0/0/0o -G255/255/255 -O -K";
+    my $tv_text;
+    if ($scenario) {
+      $tv_text = sprintf "Scenario ShakeMap: Magnitude %.1f", $src->mag();
+    } else {
+      $tv_text = sprintf "$organization ShakeMap: Magnitude %.1f", $src->mag();
+    }
+    my $tv_title = "$tv_title_x $tv_title_y 24 0 0 6 $tv_text";
+    my $pobj = new Pipe2($command)
+	  or Die "Couldn't pipe2 command:\n$command\n";
+    $pobj->println($tv_title);
+    $pobj->read($ps{TV_TITLE} = []);
+    
+    #-----------------------------------------------------------------------
+    # Draw the epicenter
+    #-----------------------------------------------------------------------
+
+    if ($src->mag() < 6.0) {
+      $epipen = "-W6/255/0/0"
+    } else {
+      $epipen = "-W6/0"
+    }
+    if (defined $epicenter_color) {
+      $command  = sprintf "$echo %f %f | $gmt_bin/psxy $tvgmtflags "
+                        . "-Sa$epicenter_size $epipen -G$epicenter_color "
+                        . "-L -O -K",
+		        $src->lon(), $src->lat();
+    } else {
+      $command  = sprintf "$echo %f %f | $gmt_bin/psxy $tvgmtflags "
+                        . "-Sa$epicenter_size $epipen -L -O -K",
+		        $src->lon(), $src->lat();
+    }
+    slurp($command, $ps{TV_EPICENTER});
+
+    #-----------------------------------------------------------------------
+    # Write the big "SCENARIO" 
+    #-----------------------------------------------------------------------
+    if ($scenario and !$noscenariosplash) {
+      my $angle = 180.0 * atan2($tvxymax[1], $tvxymax[0]) / 3.141592654;
+      my $x = $tvxymax[0] / 2;
+      my $y = $tvxymax[1] / 2;
+      my $text  = "$x $y 96 $angle 1 6 SCENARIO";
+      $command = "$echo $text | $gmt_bin/pstext -JX$tvxymax[1]/$tvwidth "
+	       . "-R0/$tvxymax[1]/0/$tvwidth -N -S4 -O -K";
+      slurp($command, $ps{TV_SCENARIO});
+
+      #-----------------------------------------------------------------------
+      # Fix a bug in pstext that fills in the text no matter what
+      #-----------------------------------------------------------------------
+      my $gcount = grep /SCENARIO/, @{$ps{TV_SCENARIO}};
+      if ($gcount > 1) {
+        my $skip = 0;
+        for (my $i = 0; $i < @{$ps{TV_SCENARIO}}; $i++) {
+          if ($ps{TV_SCENARIO}->[$i] =~ /SCENARIO/) {
+	    if ($skip lt 2) { $skip++; next; }
+	    $ps{TV_SCENARIO}->[$i]=~ s/^/%/;
+	  }
+        }
+      }
+    }
+
+    #-----------------------------------------------------------------------
+    # Make the closing postscript (with, possibly, a scalebar)
+    #-----------------------------------------------------------------------
+    #-----------------------------------------------------------------------
+    # Use "miles" if we are on American paper, "km" otherwise; (this is a 
+    # bit of a cheat, but should work most of the time)
+    #-----------------------------------------------------------------------
+    my $dunit = ($PaperRegion =~ /US/i) ? 'm' : '';
+    my $tv_offset = $sb_offset + 3.0;
+    my $tv_sb = "-Lfx$tv_offset/2.54/$epilat/${sb_length}${dunit}+l";
+    $command = "$gmt_bin/psbasemap $tvgmtflags -Bwesn $tv_sb -O";
+    slurp($command, $ps{TV_CLOSE});
+
+    $command = "$gmt_bin/psbasemap $tvgmtflags -B${ticks} -O";
+    slurp($command, $ps{TV_CLOSE_NOSB});
+
+    #-----------------------------------------------------------------------
+    # Write out the maps
+    #-----------------------------------------------------------------------
+    open FILE, "> $outputdir/tvmap.ps";
+    print FILE @{$ps{TV_BASE}}, @{$mitvgrd}, @{$ps{TV_HIWAYS}}, 
+	       @{$ps{TV_COAST}}, @{$ps{TV_XYADDON}}, 
+	       @{$ps{TV_FFAULT}}, @{$ps{TV_EPICENTER}}, 
+	       @{$ps{TV_CITIES}}, @{$ps{TV_TEXTADDON}},
+	       @{$ps{TV_TITLE}}, @{$ps{TIMESTAMP}}, @{$ps{TV_SCALE}},
+	       @{$ps{TV_SCENARIO}}, @{$ps{TV_CLOSE}};
+    close FILE or Print "Error closing file $outputdir/tvmap.ps";
+
+    open FILE, "> $outputdir/tvmap_bare.ps";
+    print FILE @{$ps{TV_BASE}}, @{$mitvgrd},
+	       @{$ps{TV_COAST}}, @{$ps{TV_XYADDON}},
+	       @{$ps{TV_FFAULT}}, @{$ps{TV_EPICENTER}},
+	       @{$ps{TV_TITLE}}, @{$ps{TIMESTAMP}}, @{$ps{TV_SCALE}},
+	       @{$ps{TV_SCENARIO}}, @{$ps{TV_CLOSE_NOSB}};
+    close FILE or Print "Error closing file $outputdir/tvmap_bare.ps";
+
+    #-----------------------------------------------------------------------
+    # Make the text file explaining the TV map
+    #-----------------------------------------------------------------------
+    my ($tvloc, $tvname, $tvmag);
+
+    if ($event_name) {
+      if ($scenario) {
+	my $nn = $event_name;
+	$nn =~ s/ *scenario//i;
+        $tvname = "$nn Scenario";
+      } else {
+        $tvname = "$event_name Earthquake";
+      }
+    } else {
+      $tvname = sprintf("Unnamed Earthquake (Event ID %s)", $src->id());
+    }
+    $tvloc  = sprintf("N%.2f W%.2f", $src->lat(), abs($src->lon()));
+    $tvloc .= ": $loc" if (defined $loc and $loc ne '');
+    $tvmag  = sprintf("%.1f", $src->mag());
+
+    open(GUIDEFH, "$map_data_dir/$tvguide") 
+      or Die "Couldn't open tvguide file $map_data_dir/$tvguide";
+    my $eqtext = $scenario ? "Planning Scenario" : "Earthquake";
+    my $scenario_text = $scenario ?
+    "IMPORTANT: THIS IS AN EARTHQUAKE PLANNING SCENARIO, NOT AN ACTUAL EARTHQUAKE.\n"
+  . "Please see the section 'Earthquake Planning Scenarios' below.\n" : "";
+    my @guide = map { s/<EARTHQUAKE>/$eqtext/;
+		      s/<DATE_STRING>/$tvdate/;
+		      s/<TIME_STRING>/$tvtime/;
+		      s/<LOCATION_STRING>/$tvloc/;
+		      s/<NAME_STRING>/$tvname/;
+		      s/<MAGNITUDE_STRING>/$tvmag/;
+		      s/<SCENARIO>/$scenario_text/; $_
+		    } <GUIDEFH>;
+    close GUIDEFH;
+
+    open(FILE, "> $outputdir/$tvguide") 
+      or Die "Couldn't open tvguide file $outputdir/$tvguide";
+    print FILE @guide;
+    close FILE or Print "Error closing file $outputdir/$tvguide";
+    if ($PaperRegion =~ /US/i) {
+      `$gmt_bin/gmtset PAPER_MEDIA $PAPER{normal_us}->{name}`;
+    } elsif ($PaperRegion =~ /EU/i) {
+      `$gmt_bin/gmtset PAPER_MEDIA $PAPER{normal_eu}->{name}`;
+    } else {
+      Die "Error: unknown region for paper type: $PaperRegion\n";
+    }
+    print "Done with tvmap\n" if $verbose;
+  #------------------------------------------------------------------------
+  # Done Making TV map
+  #------------------------------------------------------------------------
+
+  #------------------------------------------------------------------------
+  # Make the Google Earth overlay map
+  #------------------------------------------------------------------------
+    $cmap = $ii_tvmap_cmap;
+    $flags = "-P -R${map_bound} $map_coords{iiproj}";
+    my $mfile;
+    if (-e "$outputdir/tmp_mi.grd") {
+      $mfile = "$outputdir/tmp_mi.grd";
+    } else {
+      $mfile = "$outputdir/mi.grd";
+    }
+    `$gmt_bin/gmtset BASEMAP_TYPE PLAIN FRAME_PEN 0`;
+    if ($PaperRegion =~ /US/i) {
+      `$gmt_bin/gmtset PAPER_MEDIA $PAPER{tvmap_us}->{name}`;
+    } elsif ($PaperRegion =~ /EU/i) {
+      `$gmt_bin/gmtset PAPER_MEDIA $PAPER{tvmap_eu}->{name}`;
+    } else {
+      Die "Error: unknown region for paper type: $PaperRegion\n";
+    }
+    $command = "$gmt_bin/grdimage $mfile $flags -C$cmap -K";
+    slurp($command, $mioverlay);
+    $command = "$gmt_bin/pscoast -Df $flags -S0 -O";
+    slurp($command, $mioverlay);
+    open FILE, "> $outputdir/ii_overlay.ps";
+    print FILE @{$mioverlay};
+    close FILE or Print "Error closing file $outputdir/ii_overlay.ps";
+    if ($PaperRegion =~ /US/i) {
+      `$gmt_bin/gmtset PAPER_MEDIA $PAPER{normal_us}->{name}`;
+    } elsif ($PaperRegion =~ /EU/i) {
+      `$gmt_bin/gmtset PAPER_MEDIA $PAPER{normal_eu}->{name}`;
+    } else {
+      Die "Error: unknown region for paper type: $PaperRegion\n";
+    }
+    `$gmt_bin/gmtset BASEMAP_TYPE PLAIN FRAME_PEN 10`;
+    unlink("$outputdir/tmp_mi.grd") if -e "$outputdir/tmp_mi.grd";
+  #------------------------------------------------------------------------
+  # Done making the Google Earth overlay map
+  #------------------------------------------------------------------------
+
+  $sv->saveFlags($prog, $arglist) or Die "Error: Couldn't save flags";
+  return 0;
+}
+
+########################################################################
+# sub slurp($command, $array_ref)
+# Execute the command and slurp its output into an array
+########################################################################
+sub slurp {
+
+  my $cmd  = shift;
+  my $aref = shift;
+
+  print "Running: $cmd\n" if ($verbose);
+  $cmd .= "|" if ($cmd !~ /\|\s*$/);
+  open CPIPE, "$cmd" or Die "Couldn't open pipe to command:\n$cmd\n";
+  push @{$aref}, <CPIPE>;
+  close CPIPE or Die "Error running command:\n$cmd\n";
+  return 0;
+}
+
+########################################################################
+# sub configure()
+# Read the config file and set the appropriate values
+########################################################################
+sub configure {
+
+  unshift @$config_dirs, "$shake_home/data/$evid/config";
+
+  # load color file first so it can be applied to the main
+  # mapping configuration file
+  my $cfg = new LoadConfig($colorfile, $config_dirs, \&Print)
+	or Die "Couldn't open config file $colorfile";
+
+  $cfg->parse( { 'color'           => \&load_color } ) == 0 
+	or Die "Error in config file $colorfile, quitting...";
+
+  $cfg = new LoadConfig($cfile, $config_dirs, \&Print)
+	or Die "Couldn't open config file $cfile";
+
+  $cfg->parse( { 'measure_unit'          => \&measure_unit,
+                 'mi_xres'               => \&mi_xres,
+                 'mi_yres'               => \&mi_yres,
+                 'mi_xhires'             => \&mi_xhires,
+                 'mi_yhires'             => \&mi_yhires,
+                 'width'                 => \&set_width,
+                 'tvwidth'               => \&set_tvwidth,
+                 'xorig'                 => \&set_xorig,
+                 'yorig'                 => \&set_yorig,
+                 'map_axes'              => \&map_axes,
+                 'organization'          => \&organization,
+		 'station_color'         => \&station_color,
+		 'network_color'         => \&network_color,
+		 'station_symbol'        => \&station_symbol,
+		 'station_size'          => \&station_size,
+		 'contour_color'         => \&contour_color,
+		 'contour_width'         => \&contour_width,
+		 'highway_color'         => \&highway_color,
+		 'highway_width'         => \&highway_width,
+		 'fault_color'           => \&fault_color,
+		 'fault_width'           => \&fault_width,
+		 'ff_color'      	 => \&ff_color,
+		 'ff_width'      	 => \&ff_width,
+		 'border_width'          => \&border_width,
+		 'water_color'           => \&water_color,
+		 'epicenter_color'       => \&epicenter_color,
+		 'epicenter_size'        => \&epicenter_size,
+		 'main_title_size'       => \&main_title_size,
+		 'sub_title_size'        => \&sub_title_size,
+		 'city_dot_size'         => \&city_dot_size,
+		 'city_name_size'        => \&city_name_size,
+		 'tv_highway_width'      => \&tv_highway_width,
+		 'tv_highway_color'      => \&tv_highway_color,
+		 'tv_border_width'       => \&tv_border_width,
+		 'tv_city_dot_size'      => \&tv_city_dot_size,
+		 'ncontours'             => \&ncontours,
+		 'map_data_dir'          => \&map_data_dir,
+		 'topo_cmap'             => \&topo_cmap,
+		 'map_roads'             => \&map_roads,
+		 'map_faults'            => \&map_faults,
+		 'map_cities'            => \&map_cities,
+		 'map_cities_label'      => \&map_cities_label,
+		 'big_cities'            => \&big_cities,
+		 'very_big_cities'       => \&very_big_cities,
+		 'big_cities_label'      => \&big_cities_label,
+		 'very_big_cities_label' => \&very_big_cities_label,
+		 'ii_cmap'               => \&ii_cmap,
+		 'ii_tvmap_cmap'         => \&ii_tvmap_cmap,
+		 'map_topo'              => \&map_topo,
+		 'map_topo_hires'        => \&map_topo_hires,
+		 'map_intensity'         => \&map_intensity,
+		 'map_intensity_hires'   => \&map_intensity_hires,
+		 'use_gmt_coast'         => \&use_gmt_coast,
+		 'faults_on_mi'          => \&faults_on_mi,
+		 'stations_on_mi'        => \&stations_on_mi,
+		 'filled_stations_on_mi' => \&filled_stations_on_mi,
+		 'psxy_addon'            => \&psxy_addon,
+		 'pstext_addon'          => \&pstext_addon,
+		 'noscenariosplash'      => \&noscenariosplash,
+                 'sd_cmap'               => \&sd_cmap,
+                 'tvguide'               => \&tvguide,
+		 } ) == 0 
+	or Die "Error in config file $cfile, quitting...";
+
+  $cfg = new LoadConfig($webcfile,$config_dirs,\&Print)
+    or Die "Couldn't open config file $webcfile";
+
+  $cfg->parse( { 'use_utc'          => \&use_utc,
+                 'DEFAULT'          => sub { undef; }
+                } ) == 0 or Die "Error in web config file, quitting...";
+
+  return 0;
+}
+
+########################################################################
+# sub cont_scale( <value> )
+# copied verbatim from pga.pl
+########################################################################
+sub cont_scale {
+
+  my $range = shift;
+  my $tmp = $range / $ncontours;
+  my $c     = 0;
+  my ($fd, $sd);
+
+  return 0 if $range <= 0;
+
+  while ($tmp < 10) {
+    $c++; $tmp *= 10;
+  }
+  while ($tmp > 100) {
+    $c--; $tmp /= 10;
+  }
+  #
+  # $tmp is now a number between 10 and 100
+  # Make it end in zero or five
+  #
+  $tmp = int($tmp / 5);
+  $tmp *= 5;
+  #
+  # Get the first and second digit
+  #
+  $fd = int($tmp / 10);
+  $sd = int($tmp - $fd * 10);
+  #
+  # 15, 25, and 75 are okay, round the others up
+  #
+  if ($fd != 1 and $fd != 2 and $fd != 7 and $sd == 5) {
+    $tmp += 5;
+  }
+  #
+  # Now scale to the correct range
+  #
+  $tmp /= (10**$c);
+  return $tmp;
+}
+
+########################################################################
+# sub get_deg( <string> ) converts strings of the type "1.5m", "30c",
+# and "4.5" to a numeric representation in degrees of arc, where the
+# suffix 'm' means 'minutes', 'c' means 'seconds' and no suffix means
+# degrees.  Errors and badly formatted strings are not well handled.
+########################################################################
+sub get_deg {
+
+  my $value = shift;
+
+  my ($num, $suf) = $value =~ /([\d\.]+)(c|m)?/;
+  if (not defined $suf) {
+    return $num;
+  } elsif ($suf eq 'c') {
+    $num /= 3600;
+  } elsif ($suf eq 'm') {
+    $num /= 60;
+  }
+  return $num;
+}
+
+#######################################################################
+# Configuration subroutines
+#######################################################################
+sub measure_unit {
+
+  my $value = shift;
+
+  (defined $value and ($value eq 'inch' or $value eq 'cm'))
+	or return "measure_unit: bad value for measure_unit: must be 'inch' "
+                . "or 'cm'";
+  $measure_unit = $value;
+  return undef;
+}
+
+sub mi_xres {
+
+  my $value = shift;
+
+  defined $value or return "mi_xres: bad value for mi_xres";
+  $mi_xres = $value;
+  return undef;
+}
+
+sub mi_yres {
+
+  my $value = shift;
+
+  defined $value or return "mi_yres: bad value for mi_yres";
+  $mi_yres = $value;
+  return undef;
+}
+
+sub mi_xhires {
+
+  my $value = shift;
+
+  defined $value or return "mi_xhires: bad value for mi_xhires";
+  $mi_xhires = $value;
+  return undef;
+}
+
+sub mi_yhires {
+
+  my $value = shift;
+
+  defined $value or return "mi_yhires: bad value for mi_yhires";
+  $mi_yhires = $value;
+  return undef;
+}
+
+sub set_width {
+
+  my $value = shift;
+
+  (defined $value and $value > 0) or return "set_width: bad value for width";
+  $value *= 2.54 if $measure_unit eq 'inch';
+  $width = $value;
+  return undef;
+}
+
+sub set_tvwidth {
+
+  my $value = shift;
+
+  (defined $value and $value > 0) 
+		or return "set_tvwidth: bad value for tvwidth";
+  $value *= 2.54 if $measure_unit eq 'inch';
+  $tvwidth = $value;
+  return undef;
+}
+
+sub set_xorig {
+
+  my $value = shift;
+
+  (defined $value and $value > 0) or return "set_xorig: bad value for xorig";
+  $value *= 2.54 if $measure_unit eq 'inch';
+  $xorig = $value;
+  return undef;
+}
+
+sub set_yorig {
+
+  my $value = shift;
+
+  (defined $value and $value > 0) or return "set_yorig: bad value for yorig";
+  $value *= 2.54 if $measure_unit eq 'inch';
+  $yorig = $value;
+  return undef;
+}
+
+sub map_axes {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+	or return "map_axes: bad value for map_axes";
+  $ticks = $value;
+  return undef;
+}
+
+sub organization {
+
+  my $value = shift;
+
+  defined $value or return "organization: must specify value for organization";
+  $organization = $value;
+  return undef;
+}
+
+sub network_color {
+
+  my ($netcode, $color, $symbol, $size) = split " ", shift;
+  my $err;
+
+  (defined $color and defined $netcode) 
+	or return "network_color: bad args, "
+                . "specify <color> <network> [<symbol> [<size>]]";
+  $err = checkColor($color, 'network_color') and return $err;
+  $net_color{$netcode}{color}  = $colors{$color};
+  $net_color{$netcode}{symbol} = $symbol if defined $symbol;
+  if (defined $size) {
+    $size *= 2.54 if $measure_unit eq 'inch';
+    $net_color{$netcode}{size} = $size;
+  }
+  return undef;
+}
+
+sub station_color {
+
+  my ($color, $agency) = split " ", shift, 2;
+  my $err;
+
+  (defined $color and defined $agency) 
+	or return "station_color: bad args, specify <color> <network>";
+  $err = checkColor($color, 'station_color') and return $err;
+  $sta_color{$agency} = $colors{$color};
+  return undef;
+}
+
+sub station_symbol {
+
+  my $value = shift;
+
+  (defined $value) 
+	or return "station_symbol: bad arg, specify <symbol>";
+  $sta_symbol = $value;
+  return undef;
+}
+
+sub station_size {
+
+  my $value = shift;
+
+  (defined $value) 
+	or return "station_size: bad arg, specify <size>";
+  ($value >= 0)
+	or return "station_size: bad arg, size <= 0";
+  $value *= 2.54 if $measure_unit eq 'inch';
+  $sta_size = $value;
+  return undef;
+}
+
+sub contour_color {
+
+  my $value = shift;
+  my $err;
+
+  (defined $value) 
+	or return "contour_color: bad arg, specify <color>";
+  $err = checkColor($value, 'contour_color') and return $err;
+  $cont_color = $colors{$value};
+  return undef;
+}
+
+sub contour_width {
+
+  my $value = shift;
+
+  (defined $value) 
+	or return "contour_width: requires argument";
+  $cont_width = $value;
+  return undef;
+}
+
+sub highway_color {
+
+  my $value = shift;
+  my $err;
+
+  (defined $value) 
+	or return "highway_color: bad arg, specify <color>";
+  $err = checkColor($value, 'highway_color') and return $err;
+  $highway_color = $colors{$value};
+  return undef;
+}
+
+sub highway_width {
+
+  my $value = shift;
+
+  (defined $value) 
+	or return "highway_width: requires argument";
+  $highway_width = $value;
+  return undef;
+}
+
+sub fault_color {
+
+  my $value = shift;
+  my $err;
+
+  (defined $value) 
+	or return "fault_color: bad arg, specify <color>";
+  $err = checkColor($value, 'fault_color') and return $err;
+  $fault_color = $colors{$value};
+  return undef;
+}
+
+sub fault_width {
+
+  my $value = shift;
+
+  (defined $value) 
+	or return "fault_width: requires argument";
+  $fault_width = $value;
+  return undef;
+}
+
+sub ff_color {
+
+  my $value = shift;
+  my $err;
+
+  (defined $value) 
+	or return "ff_color: bad arg, specify <color>";
+  $err = checkColor($value, 'ff_color') and return $err;
+  $ff_color = $colors{$value};
+  return undef;
+}
+
+sub ff_width {
+
+  my $value = shift;
+
+  (defined $value) 
+	or return "ff_width: requires argument";
+  $ff_width = $value;
+  return undef;
+}
+
+sub border_width {
+
+  my $value = shift;
+
+  (defined $value) 
+	or return "border_width: requires argument";
+  $border_width = $value;
+  return undef;
+}
+
+sub water_color {
+
+  my $value = shift;
+  my $err;
+
+  (defined $value) 
+	or return "water_color: bad arg, specify <color>";
+  $err = checkColor($value, 'water_color') and return $err;
+  $water_color = $colors{$value};
+  return undef;
+}
+
+sub epicenter_color {
+
+  my $value = shift;
+  my $err;
+
+  (defined $value) 
+	or return "epicenter_color: bad arg, specify <color>";
+  $err = checkColor($value, 'epicenter_color') and return $err;
+  $epicenter_color = $colors{$value};
+  return undef;
+}
+
+sub epicenter_size {
+
+  my $value = shift;
+
+  (defined $value) 
+	or return "epicenter_size: requires argument";
+  ($value >= 0)
+	or return "epicenter_size: bad arg, size <= 0";
+  $value *= 2.54 if $measure_unit eq 'inch';
+  $epicenter_size = $value;
+  return undef;
+}
+
+sub main_title_size {
+
+  my $value = shift;
+
+  (defined $value) 
+	or return "main_title_size: requires argument";
+  $main_title_size = $value;
+  return undef;
+}
+
+sub sub_title_size {
+
+  my $value = shift;
+
+  (defined $value) 
+	or return "sub_title_size: requires argument";
+  $sub_title_size = $value;
+  return undef;
+}
+
+sub city_dot_size {
+
+  my $value = shift;
+
+  (defined $value) 
+	or return "city_dot_size: requires argument";
+  ($value >= 0)
+	or return "city_dot_size: bad arg, size <= 0";
+  $value *= 2.54 if $measure_unit eq 'inch';
+  $city_dot_size = $value;
+  return undef;
+}
+
+sub city_name_size {
+
+  my $value = shift;
+
+  (defined $value) 
+	or return "city_name_size: requires argument";
+  $city_name_size = $value;
+  return undef;
+}
+
+sub tv_highway_color {
+
+  my $value = shift;
+  my $err;
+
+  (defined $value) 
+	or return "tv_highway_color: bad arg, specify <color>";
+  $err = checkColor($value, 'tv_highway_color') and return $err;
+  $tv_highway_color = $colors{$value};
+  return undef;
+}
+
+sub tv_highway_width {
+
+  my $value = shift;
+
+  (defined $value) 
+	or return "tv_highway_width: requires argument";
+  $tv_highway_width = $value;
+  return undef;
+}
+
+sub tv_border_width {
+
+  my $value = shift;
+
+  (defined $value) 
+	or return "tv_border_width: requires argument";
+  $tv_border_width = $value;
+  return undef;
+}
+
+sub tv_city_dot_size {
+
+  my $value = shift;
+
+  (defined $value) 
+	or return "tv_city_dot_size: requires argument";
+  ($value >= 0)
+	or return "tv_city_dot_size: bad arg, size <= 0";
+  $value *= 2.54 if $measure_unit eq 'inch';
+  $tv_city_dot_size = $value;
+  return undef;
+}
+
+sub ncontours {
+
+  my $value = shift;
+
+  (defined $value) 
+	or return "ncontours: requires argument";
+  $ncontours = $value;
+  return undef;
+}
+
+sub map_data_dir {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+	or return "map_data_dir: bad value for map_data_dir";
+
+  $value =~ s/<SHAKE_HOME>/$shake_home/g;
+  $map_data_dir = $value;
+  return undef;
+}
+
+sub topo_cmap {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+	or return "topo_cmap: bad value for topo_cmap";
+
+  $value =~ s/<MAP_DIR>/$map_data_dir/g;
+  $topo_cmap = $value;
+  return undef;
+}
+
+sub map_roads {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+	or return "map_roads: bad value for map_roads";
+
+  $value =~ s/<MAP_DIR>/$map_data_dir/g;
+  $map_roads = $value;
+  return undef;
+}
+
+sub map_faults {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+	or return "map_faults: bad value for map_faults";
+
+  $value =~ s/<MAP_DIR>/$map_data_dir/g;
+  $map_faults = $value;
+  return undef;
+}
+
+sub map_cities {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+	or return "map_cities: bad value for map_cities";
+
+  $value =~ s/<MAP_DIR>/$map_data_dir/g;
+  $map_cities = $value;
+  return undef;
+}
+
+sub map_cities_label {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+	or return "map_cities_label: bad value for map_cities_label";
+
+  $value =~ s/<MAP_DIR>/$map_data_dir/g;
+  $map_cities_label = $value;
+  return undef;
+}
+
+sub big_cities {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+	or return "big_cities: bad value for big_cities";
+
+  $value =~ s/<MAP_DIR>/$map_data_dir/g;
+  $big_cities = $value;
+  return undef;
+}
+
+sub very_big_cities {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+	or return "very_big_cities: bad value for very_big_cities";
+
+  $value =~ s/<MAP_DIR>/$map_data_dir/g;
+  $very_big_cities = $value;
+  return undef;
+}
+
+sub big_cities_label {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+	or return "big_cities_label: bad value for big_cities_label";
+
+  $value =~ s/<MAP_DIR>/$map_data_dir/g;
+  $big_cities_label = $value;
+  return undef;
+}
+
+sub very_big_cities_label {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+	or return "very_big_cities_label: bad value for very_big_cities_label";
+
+  $value =~ s/<MAP_DIR>/$map_data_dir/g;
+  $very_big_cities_label = $value;
+  return undef;
+}
+
+sub sd_cmap {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+        or return "sd_cmap: bad value for sd_cmap";
+
+  $value =~ s/<MAP_DIR>/$map_data_dir/g;
+  $sd_cmap = $value;
+  return undef;
+}
+
+sub ii_cmap {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+	or return "ii_cmap: bad value for ii_cmap";
+
+  $value =~ s/<MAP_DIR>/$map_data_dir/g;
+  $ii_cmap = $value;
+  return undef;
+}
+
+sub ii_tvmap_cmap {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+	or return "ii_tvmap_cmap: bad value for ii_tvmap_cmap";
+
+  $value =~ s/<MAP_DIR>/$map_data_dir/g;
+  $ii_tvmap_cmap = $value;
+  return undef;
+}
+
+sub map_topo {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+	or return "map_topo: bad value for map_topo";
+
+  $value =~ s/<MAP_DIR>/$map_data_dir/g;
+  $map_topo = $value;
+  return undef;
+}
+
+sub map_topo_hires {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+	or return "map_topo_hires: bad value for map_topo_hires";
+
+  $value =~ s/<MAP_DIR>/$map_data_dir/g;
+  $map_topo_hires = $value;
+  return undef;
+}
+
+sub map_intensity {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+	or return "map_intensity: bad value for map_intensity";
+
+  $value =~ s/<MAP_DIR>/$map_data_dir/g;
+  $map_intensity = $value;
+  return undef;
+}
+
+sub map_intensity_hires {
+
+  my $value = shift;
+
+  (defined $value and $value ne '')
+	or return "map_intensity_hires: bad value for map_intensity_hires";
+
+  $value =~ s/<MAP_DIR>/$map_data_dir/g;
+  $map_intensity_hires = $value;
+  return undef;
+}
+
+
+sub load_color {
+
+  my @values = split ' ', shift;
+
+  @values == 2 or return "color: expect format <id-string> <int>/<int>/<int>";
+
+  my($id,$color,$err);
+  ($id,$color) = @values;
+
+  $err = checkRGB($color,"color") and return $err;
+  
+  $colors{$id} = $color;
+
+  return undef;
+}
+
+sub use_gmt_coast {
+
+  my $value = shift;
+
+  ($value eq 'true' or $value eq 'false')
+	or return "use_gmt_coast: bad argument, must be 'true' or 'false'";
+
+  $use_gmt_coast = $value;
+  return undef;
+}
+
+sub faults_on_mi {
+
+  my $value = shift;
+
+  ($value eq 'true' or $value eq 'false')
+	or return "faults_on_mi: bad argument, must be 'true' or 'false'";
+
+  $faults_on_mi = ($value eq 'true') ? 1 : 0;
+  return undef;
+}
+
+sub stations_on_mi {
+
+  my $value = shift;
+
+  ($value eq 'true' or $value eq 'false')
+	or return "stations_on_mi: bad argument, must be 'true' or 'false'";
+
+  $stations_on_mi = ($value eq 'true') ? 1 : 0;
+  return undef;
+}
+
+sub filled_stations_on_mi {
+
+  my $value = shift;
+
+  ($value eq 'true' or $value eq 'false')
+    or return "filled_stations_on_mi: bad argument, must be 'true' or 'false'";
+
+  $filled_stations_on_mi = ($value eq 'true') ? 1 : 0;
+  return undef;
+}
+
+sub psxy_addon {
+
+  my $h = {};
+  ($h->{'FILE'}, $h->{'FLAGS'}) = split " ", shift, 2;
+
+  (defined $h->{'FILE'} and $h->{'FILE'} ne '')
+	or return "psxy_addon: must supply a file name";
+  if (defined $map_data_dir and not -e "$map_data_dir/$h->{'FILE'}") {
+    return "psxy_addon: bad argument, file $map_data_dir/$h->{'FILE'} "
+	 . "does not exist";
+  }
+  push @xyinfo, $h;
+  return undef;
+}
+
+sub pstext_addon {
+
+  my $h = {};
+  ($h->{'FILE'}, $h->{'FLAGS'}) = split " ", shift, 2;
+
+  (defined $h->{'FILE'} and $h->{'FILE'} ne '')
+	or return "pstext_addon: must supply a file name";
+  if (defined $map_data_dir and not -e "$map_data_dir/$h->{'FILE'}") {
+    return "pstext_addon: bad argument, file $map_data_dir/$h->{'FILE'} "
+	 . "does not exist";
+  }
+  push @textinfo, $h;
+  return undef;
+}
+
+sub noscenariosplash {
+  my $value = shift;
+
+  ($value eq 'true' or $value eq 'false')
+    or return "noscenariosplash: bad argument, must be 'true' or 'false'";
+
+  $noscenariosplash = ($value eq 'true') ? 1 : 0;
+  return undef;
+}
+
+sub use_utc {
+
+  my $value = shift;
+
+  defined $value or return "use_utc: incomplete specification";
+  if ($value =~ /true/i) {
+    $use_utc = 1;
+  } else {
+    $use_utc = 0;
+  }
+  return undef;
+}
+
+sub tvguide {
+
+  my $value = shift;
+
+  defined $value or return "tvguide: incomplete specification";
+  $tvguide = $value;
+  return undef;
+}
+
+#######################################################################
+# End configuration subroutines
+#######################################################################
+
+sub checkColor {
+
+  my $value = shift;
+  my $func  = shift;
+  
+  if (not defined($colors{$value})) {
+    return "$func: must use color specified in $colorfile";
+  }
+
+  return undef;
+}
+
+sub checkRGB {
+
+  my $value = shift;
+  my $func  = shift;
+
+  my ($r, $g, $b) = $value =~ /^\s*(\d+)\/(\d+)\/(\d+)\s*$/;
+  (defined $r and defined $g and defined $b) 
+	or return "$func: color must be specified as r/g/b";
+  ($r >= 0 and $r <= 255 and
+   $g >= 0 and $g <= 255 and
+   $b >= 0 and $b <= 255)
+	or return "$func: r/g/b values must be in the range 0-255";
+  return undef;
+}
+
+
+#######################################################################
+# Check all parameters that might have default colors. If not set in
+# the config, the value will be a color code rather than RGB. If
+# necessary, convert to RGB.
+#######################################################################
+sub check_colors {
+
+  my($err,$color);
+
+  $color = $net_color{'DEFAULT'};
+  if ($color !~ m|\d{1,3}/\d{1,3}/\d{1,3}|) {
+    $err = checkColor($color,'check_colors') and return $err;
+
+    $net_color{'DEFAULT'} = $colors{$color};
+  }
+
+  if ($cont_color !~ m|\d{1,3}/\d{1,3}/\d{1,3}|) {
+    $err = checkColor($cont_color,'check_colors') and return $err;
+
+    $cont_color = $colors{$cont_color};
+  }
+
+  if ($highway_color !~ m|\d{1,3}/\d{1,3}/\d{1,3}|) {
+    $err = checkColor($highway_color,'check_colors') and return $err;
+
+    $highway_color = $colors{$highway_color};
+  }
+
+  if ($tv_highway_color !~ m|\d{1,3}/\d{1,3}/\d{1,3}|) {
+    $err = checkColor($tv_highway_color,'check_colors') and return $err;
+
+    $tv_highway_color = $colors{$tv_highway_color};
+  }
+
+  if ($fault_color !~ m|\d{1,3}/\d{1,3}/\d{1,3}|) {
+    $err = checkColor($fault_color,'check_colors') and return $err;
+
+    $fault_color = $colors{$fault_color};
+  }
+
+  if ($ff_color !~ m|\d{1,3}/\d{1,3}/\d{1,3}|) {
+    $err = checkColor($ff_color,'check_colors') and return $err;
+
+    $ff_color = $colors{$ff_color};
+  }
+
+  if ($water_color !~ m|\d{1,3}/\d{1,3}/\d{1,3}|) {
+    $err = checkColor($water_color,'check_colors') and return $err;
+
+    $water_color = $colors{$water_color};
+  }
+
+  #------------------------------------------------------------------------
+  # Epicenter color can be undefined...
+  #------------------------------------------------------------------------
+  if (defined $epicenter_color and 
+    $epicenter_color !~ m|\d{1,3}/\d{1,3}/\d{1,3}|) {
+    $err = checkColor($epicenter_color,'check_colors') and return $err;
+
+    $epicenter_color = $colors{$epicenter_color};
+  }
+}
+
+########################################################################
+# sub plot_cities(<gmtflags>, <file>, <ps_ref>, <label>, <tv>, <width>, <height>)
+# The arguments are:
+#	<file>	- The path to a file containing city information in one
+#                 of the two formats described in the config file for
+#                 the parameters 'map_cities' and 'map_cities_label'
+#	<ps_ref>- a reference to the array that holds the PostScript
+#	<label> - Non-zero if the format of <file>, above, is the _label
+#                 format; zero if the format is the simpler lon,lat,name
+#                 format
+#	<tv>    - True (non-zero) if the map being made is the tvmap,
+#                 zero otherwise
+#	<width> - The width of the the map
+#	<height>- The height of the the map
+########################################################################
+sub plot_cities {
+
+  my $file  = shift;
+  my $ps    = shift;
+  my $label = shift;
+  my $tv    = shift;
+  my $width = shift;
+  my $xy_top = shift;
+
+  my $flags;
+  my ($lat, $lon, $cname);
+  my ($dlon, $dlat, $nmsz, $angle, $fnt, $jtfy);
+  my ($namecmd, $loccmd, $nmobj, $locobj);
+  my $dot;
+
+  %block = ();
+
+  open CFILE, "$file" or Die "Unable to open $file";
+
+  if ($tv) {
+    $dot = $tv_city_dot_size;
+    $flags = $tvgmtflags;
+  } else {
+    $dot = $city_dot_size;
+    $flags = $gmtflags;
+  }
+  $map_coords{width} = $width;
+  $map_coords{xy_top} = $xy_top;
+
+  $namecmd = "$gmt_bin/pstext $flags -Gblack -Sthicker,white -O -K";
+  $loccmd  = "$gmt_bin/psxy $flags -Sc$dot -W2,white -G0 -O -K";
+  $nmobj = new Pipe2($namecmd, "$outputdir/.tmpfile")
+	or Die "Couldn't pipe2 command:\n$namecmd\n";
+  $locobj = new Pipe2($loccmd, "$outputdir/.tmpfile2")
+	or Die "Couldn't pipe2 command:\n$loccmd\n";
+
+  if (not $label) {
+    $dlon = 0.0;
+    $dlat = $latspan /8 * 0.1;
+    if ($tv) {
+      if ($lonspan < 4.0) {
+	$nmsz = 20;
+      } else {
+	$nmsz = 16;
+      }
+      $fnt   = 1;
+    } else {
+      $nmsz = 10;
+      $fnt  = 0;
+    }
+    $angle = 0;
+    $jtfy  = 2;
+  }
+
+  for (my $city = <CFILE>; defined $city; $city = <CFILE>) {
+    if ($label) {
+      ($lon, $dlon, $lat, $dlat, $nmsz, $angle, $fnt, $jtfy, $cname) 
+						= split " ", $city, 9;
+    } else {
+      ($lon, $lat, $cname) = split " ", $city, 3;
+    }
+    next if $cname =~ /\#/;
+    $cname =~ s/,.*$//;
+
+    if ($tv) {
+      next if (abs($lon - $lonmin) / $lonspan < $tvlonratio
+	    or abs($lon - $lonmax) / $lonspan < $tvlonratio
+	    or abs($lat - $latmin) / $latspan < $tvlatratio
+	    or abs($lat - $latmax) / $latspan < $tvlatratio);
+    } else {
+      next if (abs($lon - $lonmin) < 0.15
+	    or abs($lonmax - $lon) < 0.15
+	    or abs($lat - $latmin) < 0.15
+	    or abs($latmax - $lat) < 0.15);
+    }
+    next if ($lon < $lonmin or $lon > $lonmax or
+                $lat < $latmin or $lat > $latmax);
+    chomp $cname;
+    $cname =~ s/\s*$//;
+
+    my $res = block_text($cname,$lat,$lon,$lat+$dlat,$nmsz);
+    next unless ($res eq 'SUCCESS');
+
+    $locobj->println("$lon $lat\n");
+    $lat += $dlat;
+    $lon += $dlon;
+    $nmobj->println("$lon $lat $nmsz $angle $fnt $jtfy $cname\n");
+  }
+  #-----------------------------------------------------------------------
+  # For some reason, we have to close both of the inputs before we
+  # can read either output...
+  #-----------------------------------------------------------------------
+  $nmobj->close();
+  $locobj->close();
+  $nmobj->read($ps);
+  $locobj->read($ps);
+  return;
+} 
+
+sub latlon2xy {
+# Convert a lat-lon pair into X-Y coordinates using the map coordinate
+# data in %map_coords
+
+  my ($lat,$lon) = @_;
+  my $epilat = $map_coords{epilat};
+  my $epilon = $map_coords{epilon};
+  my $xy_top = $map_coords{xy_top};
+  my $width  = $map_coords{width};
+  my $latspan = $map_coords{latspan};
+  my $lonspan = $map_coords{lonspan};
+#  print "$epilat/$epilon : $xy_top/$width : $latspan:$lonspan\n";
+  my $y = ($lat - $epilat) * $JPG_DPC * $xy_top / ($latspan * 2);
+  my $x = ($lon - $epilon) * $JPG_DPC * $width / ($lonspan * 2);
+  $y = int ($y + 0.5);
+  $x = int ($x + 0.5);
+#  print "Latlon2XY: $lat,$lon => $x,$y.\n";
+
+  return ($x,$y);
+}
+
+sub block_text {
+# Keep track of used points in x-y hash %block. Call this function with
+# a text string. It calculates the x-y rectangle taken by the text, and
+# returns failure if that rectangle would overwrite points already used
+# by a previous string.
+
+  my ($text,@pts) = add_pts(@_);
+  my $res;
+  foreach (@pts) {
+    $res = $$_; return $res if ((defined $res) and $res ne $text);
+  }
+  # All clear
+  foreach (@pts) { $$_ = $text; }
+  return "SUCCESS";
+}
+
+sub add_pts {
+# Used by subroutine block_text
+
+  my ($text,$lat,$lon,$offset,$font) = @_;
+  my @pts;
+
+  my ($x,$y) = latlon2xy($lat,$lon);
+
+  if ($offset) {
+    push @pts,\($block{$x}{$y});
+    ($x,$y) = latlon2xy($offset,$lon);
+  }
+  my $x_offset = int ($font * length($text)/2 + 0.5);
+
+  for (my $y1 = 0; $y1 <= $font; $y1++) {
+    for (my $x1 = -$x_offset; $x1 <= $x_offset; $x1++) {
+      my $x2 = $x + $x1;
+      my $y2 = $y + $y1;
+      push @pts,\($block{$x2}{$y2});
+    }
+  }
+  return ($text,@pts);
+}
+
