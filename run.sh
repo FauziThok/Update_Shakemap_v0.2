@@ -26,7 +26,7 @@ printf "/home/sysop/shakemap/bin/mapping >> /home/sysop/shakemap/bin/mapping.old
 printf "/home/sysop/shakemap/config/mapping.conf >> /home/sysop/shakemap/config/mapping.conf.old\n"
 printf "/home/sysop/shakemap/config/genex.conf >> /home/sysop/shakemap/config/genex.conf.old\n"
 
-chmod -R 777 Update_Shakemap_v0.2
+chmod -R 777 /home/sysop/Update_Shakemap_v0.2
 
 ## Updating shakemap
 # Source directory
